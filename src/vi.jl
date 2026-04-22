@@ -2,49 +2,23 @@
     AbstractVariationalFamily
 
 Marker supertype for variational-sampling schemes.
-
-To add a new family, subtype `AbstractVariationalFamily` and provide a
-`_draw_sample_block(::YourFamily, optimizer, likelihood, position, rng, config)`
-method.
 """
 abstract type AbstractVariationalFamily end
 struct MGVIFamily <: AbstractVariationalFamily end
 struct GeoVIFamily <: AbstractVariationalFamily end
 
-const AbstractVIScheme = AbstractVariationalFamily
-const MGVIScheme = MGVIFamily
-const GeoVIScheme = GeoVIFamily
-
 """
-    AbstractDivergence
     AbstractFDivergence
 
-Marker supertype for divergence objectives optimized by the outer VI loop.
+Marker supertype for f-divergence objectives optimized by the outer VI loop.
 
-To add a new divergence, subtype `AbstractDivergence` and implement the
-internal objective hooks `_kl_value(::YourDivergence, ...)` and
-`_kl_metric(::YourDivergence, ...)`.
+To add a new divergence, subtype `AbstractFDivergence` and implement the
+internal objective hooks `_fdivergence_value(::YourDivergence, ...)` and
+`_fdivergence_fishermetric(::YourDivergence, ...)`.
 """
-abstract type AbstractDivergence end
-const AbstractFDivergence = AbstractDivergence
-struct ReverseKL <: AbstractDivergence end
-struct ForwardKL <: AbstractDivergence end
-
-"""
-    AbstractOptimizer
-
-Marker supertype for built-in optimizer backends.
-
-To add a new optimizer backend, subtype `AbstractOptimizer` and implement
-`_optimize(optimizer, x0; fun_and_grad, hessp, kwargs...)`. If the backend
-needs persistent state across VI iterations, also implement
-`_optimizer_state(optimizer, x0, previous_result)`.
-
-Any `Optimisers.AbstractRule` is also accepted directly without subtyping
-`AbstractOptimizer`.
-"""
-abstract type AbstractOptimizer end
-struct NewtonCG <: AbstractOptimizer end
+abstract type AbstractFDivergence end
+struct ReverseKL <: AbstractFDivergence end
+struct ForwardKL <: AbstractFDivergence end
 
 struct VIConfig{AD,DL,NU,OO}
     adtype::AD
@@ -56,6 +30,28 @@ struct VIConfig{AD,DL,NU,OO}
     optimizer_options::OO
 end
 
+struct VariationalProblem{L,S,F,D,O,C,AD,DL,NU,OO}
+    likelihood::L
+    initial_samples::S
+    family::F
+    divergence::D
+    optimizer::O
+    config::C
+    adtype::AD
+    draw_linear_options::DL
+    nonlinear_update_options::NU
+    optimizer_options::OO
+    n_base_draws::Int
+end
+
+struct VIState{R,S,M}
+    iteration::Int
+    rng::R
+    sample_state::S
+    minimization_state::M
+    cache::Any
+end
+
 function VIConfig(;
     adtype=ADTypes.AutoFiniteDiff(),
     n_iterations::Integer=0,
@@ -64,13 +60,7 @@ function VIConfig(;
     draw_linear=(;),
     nonlinear_update=(;),
     optimizer_options=(;),
-    kl_minimize=nothing,
 )
-    if kl_minimize !== nothing
-        optimizer_options == (;) ||
-            throw(ArgumentError("specify only one of `optimizer_options` or `kl_minimize`"))
-        optimizer_options = kl_minimize
-    end
     adtype === nothing && (adtype = ADTypes.AutoFiniteDiff())
     n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))
     n_samples >= 0 || throw(ArgumentError("`n_samples` must be non-negative"))
@@ -87,26 +77,6 @@ function VIConfig(;
     )
 end
 
-function Base.getproperty(cfg::VIConfig, name::Symbol)
-    if name === :kl_minimize
-        return getfield(cfg, :optimizer_options)
-    end
-    return getfield(cfg, name)
-end
-
-function Base.propertynames(cfg::VIConfig, private::Bool=false)
-    names = fieldnames(typeof(cfg))
-    return private ? names : (names..., :kl_minimize)
-end
-
-struct VIState{R,S,M}
-    iteration::Int
-    rng::R
-    sample_state::S
-    minimization_state::M
-    cache::Any
-end
-
 function VIState(;
     iteration::Integer=0,
     rng=nothing,
@@ -117,9 +87,82 @@ function VIState(;
     return VIState(Int(iteration), rng, sample_state, minimization_state, cache)
 end
 
-initialize_vi(rng; config::VIConfig) = VIState(iteration=0, rng=rng)
+function _resolve_draw_linear_options(options)
+    return (
+        cg_rtol=_option(options, :cg_rtol, 1e-8),
+        cg_atol=_option(options, :cg_atol, 0.0),
+        cg_maxiter=_option(options, :cg_maxiter, nothing),
+        cg_miniter=_option(options, :cg_miniter, 0),
+        throw_on_failure=_option(options, :throw_on_failure, true),
+    )
+end
+
+function _resolve_nonlinear_update_options(options)
+    return (
+        maxiter=_option(options, :maxiter, 20),
+        miniter=_option(options, :miniter, 0),
+        xtol=_option(options, :xtol, 1e-5),
+        absdelta=_option(options, :absdelta, nothing),
+        cg_rtol=_option(options, :cg_rtol, 1e-8),
+        cg_atol=_option(options, :cg_atol, 0.0),
+        cg_maxiter=_option(options, :cg_maxiter, nothing),
+        cg_miniter=_option(options, :cg_miniter, 0),
+        throw_on_failure=_option(options, :throw_on_failure, true),
+    )
+end
+
+function _resolve_optimizer_options(options)
+    return (
+        maxiter=_option(options, :maxiter, 20),
+        miniter=_option(options, :miniter, 0),
+        xtol=_option(options, :xtol, 1e-5),
+        absdelta=_option(options, :absdelta, nothing),
+        cg_rtol=_option(options, :cg_rtol, 1e-8),
+        cg_atol=_option(options, :cg_atol, 0.0),
+        cg_maxiter=_option(options, :cg_maxiter, nothing),
+        cg_miniter=_option(options, :cg_miniter, 0),
+        fd_eps=_option(options, :fd_eps, 1e-6),
+    )
+end
 
 _n_base_draws(config::VIConfig) = config.mirrored ? (config.n_samples ÷ 2) : config.n_samples
+
+_problem_samples(samples::Samples) = samples
+_problem_samples(position::AbstractArray) = Samples(position, nothing; keys=nothing)
+
+function _problem_adtype(config::VIConfig, samples::Samples)
+    samples.position === nothing && return config.adtype
+    return _infer_adtype(config.adtype, samples.position)
+end
+
+function VariationalProblem(
+    lh::AbstractLikelihood,
+    position_or_samples;
+    family::AbstractVariationalFamily=GeoVIFamily(),
+    divergence::AbstractFDivergence=ReverseKL(),
+    optimizer=NewtonCG(),
+    config::VIConfig=VIConfig(),
+)
+    samples = _problem_samples(position_or_samples)
+    _require_supported(divergence, optimizer)
+    return VariationalProblem(
+        lh,
+        samples,
+        family,
+        divergence,
+        optimizer,
+        config,
+        _problem_adtype(config, samples),
+        _resolve_draw_linear_options(config.draw_linear),
+        _resolve_nonlinear_update_options(config.nonlinear_update),
+        _resolve_optimizer_options(config.optimizer_options),
+        _n_base_draws(config),
+    )
+end
+
+initialize_vi(rng; config::VIConfig) = VIState(iteration=0, rng=rng)
+initialize_vi(problem::VariationalProblem, rng::AbstractRNG=Random.default_rng()) =
+    VIState(iteration=0, rng=rng)
 
 function _single_sample_block(residual::AbstractArray)
     return reshape(residual, (1, size(residual)...))
@@ -159,82 +202,96 @@ function _restore_cache(state::VIState, cache)
 end
 
 function _draw_sample_block(
+    problem::VariationalProblem,
     ::MGVIFamily,
-    optimizer,
-    lh::AbstractLikelihood,
     position::AbstractArray,
     rng::AbstractRNG,
-    config::VIConfig,
 )
-    residual, info = draw_linear_residual(lh, position, rng; config.draw_linear...)
-    block = config.mirrored ? _stack_residuals(residual, -residual) : _single_sample_block(residual)
-    return block, info
+    linear_draw = draw_linear_residual(
+        problem.likelihood,
+        position,
+        rng;
+        problem.draw_linear_options...,
+    )
+    block = problem.config.mirrored ?
+        _stack_residuals(linear_draw.residual, -linear_draw.residual) :
+        _single_sample_block(linear_draw.residual)
+    return block, linear_draw
 end
 
 function _draw_sample_block(
+    problem::VariationalProblem,
     ::GeoVIFamily,
-    optimizer,
-    lh::AbstractLikelihood,
     position::AbstractArray,
     rng::AbstractRNG,
-    config::VIConfig,
 )
-    if config.mirrored
-        return draw_residual(
-            lh,
-            position,
-            rng;
-            draw_linear_kwargs=config.draw_linear,
-            optimizer=optimizer,
-            optimizer_options=config.nonlinear_update,
-        )
-    end
-
-    metric_sample, prior_sample = _draw_metric_sample(lh, position, rng)
-    linear_residual, linear_info = draw_linear_residual(
-        lh,
+    linear_draw = draw_linear_residual(
+        problem.likelihood,
         position,
         rng;
-        config.draw_linear...,
-        metric_sample=metric_sample,
-        x0=prior_sample,
+        problem.draw_linear_options...,
     )
-    curved_residual, curved_info = update_nonlinear_residual(
-        lh,
+
+    if problem.config.mirrored
+        positive_update = update_nonlinear_residual(
+            problem.likelihood,
+            position,
+            linear_draw;
+            optimizer=problem.optimizer,
+            optimizer_options=problem.nonlinear_update_options,
+            throw_on_failure=problem.nonlinear_update_options.throw_on_failure,
+        )
+        negative_update = update_nonlinear_residual(
+            problem.likelihood,
+            position,
+            -linear_draw.residual;
+            metric_sample=linear_draw.metric_sample,
+            metric_sample_sign=-1,
+            optimizer=problem.optimizer,
+            optimizer_options=problem.nonlinear_update_options,
+            throw_on_failure=problem.nonlinear_update_options.throw_on_failure,
+        )
+        draw = MirroredResidualDraw(
+            _stack_residuals(positive_update.residual, negative_update.residual),
+            linear_draw,
+            positive_update,
+            negative_update,
+        )
+        return draw.residuals, draw
+    end
+
+    curved_update = update_nonlinear_residual(
+        problem.likelihood,
         position,
-        linear_residual;
-        metric_sample=metric_sample,
-        optimizer=optimizer,
-        optimizer_options=config.nonlinear_update,
+        linear_draw;
+        optimizer=problem.optimizer,
+        optimizer_options=problem.nonlinear_update_options,
+        throw_on_failure=problem.nonlinear_update_options.throw_on_failure,
     )
-    return _single_sample_block(curved_residual), (linear=linear_info, positive=curved_info)
+    return _single_sample_block(curved_update.residual), curved_update
 end
 
 function _draw_samples(
-    lh::AbstractLikelihood,
+    problem::VariationalProblem,
     position::AbstractArray,
-    family::AbstractVariationalFamily,
-    optimizer,
     rng::AbstractRNG,
-    config::VIConfig,
 )
-    if config.n_samples == 0
+    if problem.config.n_samples == 0
         return Samples(position, nothing; keys=nothing),
-        (family=family, mirrored=config.mirrored, n_draws=0)
+        (family=problem.family, mirrored=problem.config.mirrored, n_draws=0)
     end
 
-    n_draws = _n_base_draws(config)
-    first_block, _ = _draw_sample_block(family, optimizer, lh, position, rng, config)
-    residuals = _allocate_sample_residuals(first_block, n_draws)
+    first_block, _ = _draw_sample_block(problem, problem.family, position, rng)
+    residuals = _allocate_sample_residuals(first_block, problem.n_base_draws)
     _write_sample_block!(residuals, 1, first_block)
 
-    for i in 2:n_draws
-        block, _ = _draw_sample_block(family, optimizer, lh, position, rng, config)
+    for i in 2:problem.n_base_draws
+        block, _ = _draw_sample_block(problem, problem.family, position, rng)
         _write_sample_block!(residuals, i, block)
     end
 
-    return Samples(position, residuals; keys=Base.OneTo(n_draws)),
-    (family=family, mirrored=config.mirrored, n_draws=n_draws)
+    return Samples(position, residuals; keys=Base.OneTo(problem.n_base_draws)),
+    (family=problem.family, mirrored=problem.config.mirrored, n_draws=problem.n_base_draws)
 end
 
 _negative_logposterior(lh::AbstractLikelihood, x::AbstractArray) =
@@ -244,7 +301,12 @@ function _sample_position(position::AbstractArray, residuals::AbstractArray, i::
     return _sample_slice(residuals, i) .+ position
 end
 
-function _kl_value(::ReverseKL, lh::AbstractLikelihood, position::AbstractArray, residuals)
+function _fdivergence_value(
+    ::ReverseKL,
+    lh::AbstractLikelihood,
+    position::AbstractArray,
+    residuals,
+)
     residuals === nothing && return _negative_logposterior(lh, position)
 
     value = zero(eltype(position))
@@ -255,7 +317,12 @@ function _kl_value(::ReverseKL, lh::AbstractLikelihood, position::AbstractArray,
     return value / n
 end
 
-function _kl_value(::ForwardKL, lh::AbstractLikelihood, position::AbstractArray, residuals)
+function _fdivergence_value(
+    ::ForwardKL,
+    lh::AbstractLikelihood,
+    position::AbstractArray,
+    residuals,
+)
     throw(
         ArgumentError(
             "`ForwardKL` is not implemented yet; only `ReverseKL()` is supported in `fit`",
@@ -325,20 +392,20 @@ function _value_and_gradient(
     throw(ArgumentError(_unsupported_adtype_message(adtype)))
 end
 
-function _kl_value_and_gradient(
+function _fdivergence_value_and_gradient(
     adtype,
-    divergence::AbstractDivergence,
+    divergence::AbstractFDivergence,
     lh::AbstractLikelihood,
     position::AbstractArray,
     residuals;
     fd_eps::Real=1e-6,
 )
-    objective = x -> _kl_value(divergence, lh, x, residuals)
+    objective = x -> _fdivergence_value(divergence, lh, x, residuals)
     return _value_and_gradient(adtype, objective, position; fd_eps=fd_eps)
 end
 
-function _kl_metric(
-    ::AbstractDivergence,
+function _fdivergence_fishermetric(
+    ::AbstractFDivergence,
     lh::AbstractLikelihood,
     position::AbstractArray,
     residuals,
@@ -358,7 +425,7 @@ function _kl_metric(
     return result
 end
 
-function _require_supported(divergence::AbstractDivergence, optimizer)
+function _require_supported(divergence::AbstractFDivergence, optimizer)
     divergence isa ReverseKL || throw(
         ArgumentError(
             "`fit` currently supports `ReverseKL()` only; got $(typeof(divergence))",
@@ -377,69 +444,87 @@ function _previous_optimizer_state(optimizer, x0, previous_result)
     return _optimizer_state(optimizer, x0, previous_result)
 end
 
+_outer_vi_objective(divergence, likelihood, residuals, x) =
+    _fdivergence_value(divergence, likelihood, x, residuals)
+
+function _outer_vi_value_and_gradient(
+    adtype,
+    divergence,
+    likelihood,
+    residuals,
+    x;
+    fd_eps=1e-6,
+)
+    objective = y -> _outer_vi_objective(divergence, likelihood, residuals, y)
+    return _value_and_gradient(adtype, objective, x; fd_eps=fd_eps)
+end
+
+_outer_vi_metric(divergence, likelihood, residuals, x, v) =
+    _fdivergence_fishermetric(divergence, likelihood, x, residuals, v)
+
+_materialize_step_position(x) = x
+
 function _update_position(
-    lh::AbstractLikelihood,
-    divergence::AbstractDivergence,
-    optimizer,
+    problem::VariationalProblem,
     samples::Samples,
-    config::VIConfig,
     previous_minimization_state=nothing,
 )
-    _require_supported(divergence, optimizer)
-
-    fd_eps = _option(config.optimizer_options, :fd_eps, 1e-6)
-    adtype = _infer_adtype(config.adtype, samples.position)
     optimizer_state = _previous_optimizer_state(
-        optimizer,
+        problem.optimizer,
         samples.position,
         previous_minimization_state,
     )
-    objective = x -> _kl_value(divergence, lh, x, samples.residuals)
+    divergence = problem.divergence
+    likelihood = problem.likelihood
+    residuals = samples.residuals
+    adtype = problem.adtype
+    fd_eps = problem.optimizer_options.fd_eps
     result = _optimize(
-        optimizer,
+        problem.optimizer,
         samples.position;
-        fun_and_grad=x -> _value_and_gradient(adtype, objective, x; fd_eps=fd_eps),
-        hessp=(x, v) -> _kl_metric(divergence, lh, x, samples.residuals, v),
-        maxiter=_option(config.optimizer_options, :maxiter, 20),
-        miniter=_option(config.optimizer_options, :miniter, 0),
-        xtol=_option(config.optimizer_options, :xtol, 1e-5),
-        absdelta=_option(config.optimizer_options, :absdelta, nothing),
-        cg_rtol=_option(config.optimizer_options, :cg_rtol, 1e-8),
-        cg_atol=_option(config.optimizer_options, :cg_atol, 0.0),
-        cg_maxiter=_option(config.optimizer_options, :cg_maxiter, nothing),
-        cg_miniter=_option(config.optimizer_options, :cg_miniter, 0),
+        fun_and_grad=x -> _outer_vi_value_and_gradient(
+            adtype,
+            divergence,
+            likelihood,
+            residuals,
+            x;
+            fd_eps=fd_eps,
+        ),
+        hessp=(x, v) -> _outer_vi_metric(divergence, likelihood, residuals, x, v),
+        maxiter=problem.optimizer_options.maxiter,
+        miniter=problem.optimizer_options.miniter,
+        xtol=problem.optimizer_options.xtol,
+        absdelta=problem.optimizer_options.absdelta,
+        cg_rtol=problem.optimizer_options.cg_rtol,
+        cg_atol=problem.optimizer_options.cg_atol,
+        cg_maxiter=problem.optimizer_options.cg_maxiter,
+        cg_miniter=problem.optimizer_options.cg_miniter,
         optimizer_state=optimizer_state,
     )
     return result
 end
 
 function _step_vi_impl(
-    lh::AbstractLikelihood,
+    problem::VariationalProblem,
     samples::Samples,
-    family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
-    optimizer,
     state::VIState,
-    config::VIConfig,
 )
     drawn_samples, sample_state = _draw_samples(
-        lh,
+        problem,
         samples.position,
-        family,
-        optimizer,
         state.rng,
-        config,
     )
     minimization_state = _update_position(
-        lh,
-        divergence,
-        optimizer,
+        problem,
         drawn_samples,
-        config,
         state.minimization_state,
     )
 
-    new_samples = Samples(minimization_state.x, drawn_samples.residuals; keys=drawn_samples.keys)
+    new_samples = Samples(
+        _materialize_step_position(minimization_state.x),
+        drawn_samples.residuals;
+        keys=drawn_samples.keys,
+    )
     new_state = VIState(
         iteration=state.iteration + 1,
         rng=state.rng,
@@ -450,105 +535,117 @@ function _step_vi_impl(
 end
 
 function _step_vi_default(
-    adtype,
-    lh::AbstractLikelihood,
+    problem::VariationalProblem,
     samples::Samples,
-    family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
-    optimizer,
     state::VIState,
-    config::VIConfig,
 )
     new_samples, new_state = _step_vi_impl(
-        lh,
+        problem,
         samples,
-        family,
-        divergence,
-        optimizer,
         _strip_cache(state),
-        config,
     )
     return new_samples, _restore_cache(new_state, state.cache)
 end
 
 function _step_vi(
     adtype,
-    lh::AbstractLikelihood,
+    problem::VariationalProblem,
     samples::Samples,
-    family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
-    optimizer,
     state::VIState,
-    config::VIConfig,
 )
-    return _step_vi_default(adtype, lh, samples, family, divergence, optimizer, state, config)
+    return _step_vi_default(problem, samples, state)
 end
+
+function step_vi(
+    problem::VariationalProblem,
+    position::AbstractArray,
+    state::VIState,
+)
+    return step_vi(problem, Samples(position, nothing; keys=nothing), state)
+end
+
+function step_vi(
+    problem::VariationalProblem,
+    samples::Samples,
+    state::VIState,
+)
+    return _step_vi(problem.adtype, problem, samples, state)
+end
+
+step_vi(problem::VariationalProblem, state::VIState) = step_vi(problem, problem.initial_samples, state)
 
 function step_vi(
     lh::AbstractLikelihood,
     position::AbstractArray,
     family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
+    divergence::AbstractFDivergence,
     optimizer,
     state::VIState,
     config::VIConfig,
 )
-    return step_vi(
+    problem = VariationalProblem(
         lh,
-        Samples(position, nothing; keys=nothing),
-        family,
-        divergence,
-        optimizer,
-        state,
-        config,
+        position;
+        family=family,
+        divergence=divergence,
+        optimizer=optimizer,
+        config=config,
     )
+    return step_vi(problem, position, state)
 end
 
 function step_vi(
     lh::AbstractLikelihood,
     samples::Samples,
     family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
+    divergence::AbstractFDivergence,
     optimizer,
     state::VIState,
     config::VIConfig,
 )
-    adtype = _infer_adtype(config.adtype, samples.position)
-    return _step_vi(adtype, lh, samples, family, divergence, optimizer, state, config)
+    problem = VariationalProblem(
+        lh,
+        samples;
+        family=family,
+        divergence=divergence,
+        optimizer=optimizer,
+        config=config,
+    )
+    return step_vi(problem, samples, state)
 end
 
 function fit(
-    lh::AbstractLikelihood,
-    position::AbstractArray,
-    family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
-    optimizer;
-    config::VIConfig=VIConfig(),
+    problem::VariationalProblem;
     rng=Random.default_rng(),
 )
-    state = initialize_vi(rng; config=config)
-    samples = Samples(position, nothing; keys=nothing)
-    for _ in 1:config.n_iterations
-        samples, state = step_vi(lh, samples, family, divergence, optimizer, state, config)
+    state = initialize_vi(problem, rng)
+    samples = problem.initial_samples
+    for _ in 1:problem.config.n_iterations
+        samples, state = step_vi(problem, samples, state)
     end
     return samples, state
 end
 
+fit(rng::AbstractRNG, problem::VariationalProblem) = fit(problem; rng=rng)
+
 function fit(
     lh::AbstractLikelihood,
-    samples::Samples,
+    position_or_samples,
     family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
+    divergence::AbstractFDivergence,
     optimizer;
     config::VIConfig=VIConfig(),
     rng=Random.default_rng(),
 )
-    state = initialize_vi(rng; config=config)
-    current = samples
-    for _ in 1:config.n_iterations
-        current, state = step_vi(lh, current, family, divergence, optimizer, state, config)
-    end
-    return current, state
+    problem = VariationalProblem(
+        lh,
+        position_or_samples;
+        family=family,
+        divergence=divergence,
+        optimizer=optimizer,
+        config=config,
+    )
+    return fit(problem; rng=rng)
 end
 
 function fit(
@@ -556,18 +653,26 @@ function fit(
     lh::AbstractLikelihood,
     position_or_samples,
     family::AbstractVariationalFamily,
-    divergence::AbstractDivergence,
+    divergence::AbstractFDivergence,
     optimizer;
     config::VIConfig=VIConfig(),
 )
-    return fit(lh, position_or_samples, family, divergence, optimizer; config=config, rng=rng)
+    return fit(
+        lh,
+        position_or_samples,
+        family,
+        divergence,
+        optimizer;
+        config=config,
+        rng=rng,
+    )
 end
 
 function fit(
     lh::AbstractLikelihood,
     position_or_samples;
     family::AbstractVariationalFamily=GeoVIFamily(),
-    divergence::AbstractDivergence=ReverseKL(),
+    divergence::AbstractFDivergence=ReverseKL(),
     optimizer=NewtonCG(),
     config::VIConfig=VIConfig(),
     rng=Random.default_rng(),
@@ -580,12 +685,9 @@ function fit(
     lh::AbstractLikelihood,
     position_or_samples;
     family::AbstractVariationalFamily=GeoVIFamily(),
-    divergence::AbstractDivergence=ReverseKL(),
+    divergence::AbstractFDivergence=ReverseKL(),
     optimizer=NewtonCG(),
     config::VIConfig=VIConfig(),
 )
     return fit(lh, position_or_samples, family, divergence, optimizer; config=config, rng=rng)
 end
-
-optimize_vi(args...; kwargs...) = fit(args...; kwargs...)
-optimize_kl(args...; kwargs...) = fit(args...; kwargs...)

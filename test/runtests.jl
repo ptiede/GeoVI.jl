@@ -206,14 +206,12 @@ using Random
         @test cfg.n_samples == 6
         @test cfg.draw_linear == (;)
         @test cfg.optimizer_options == (;)
-        @test cfg.kl_minimize == (;)
         @test GeoVI._infer_adtype(cfg.adtype, [1.0, 2.0]) isa GeoVI.ADTypes.AutoFiniteDiff
         @test GeoVI._value_and_gradient(cfg.adtype, x -> sum(abs2, x), [1.0, 2.0])[2] ≈ [2.0, 4.0] atol = 1e-5
 
-        cfg_alias = VIConfig(kl_minimize=(; maxiter=10), n_samples=4, adtype=nothing)
+        cfg_alias = VIConfig(optimizer_options=(; maxiter=10), n_samples=4, adtype=nothing)
         @test cfg_alias.adtype isa GeoVI.ADTypes.AutoFiniteDiff
         @test cfg_alias.optimizer_options == (; maxiter=10)
-        @test cfg_alias.kl_minimize == (; maxiter=10)
 
         state = initialize_vi(:rng; config=cfg)
         @test state.iteration == 0
@@ -221,9 +219,23 @@ using Random
         @test state.sample_state === nothing
 
         @test_throws ArgumentError VIConfig(n_iterations=1, n_samples=3, mirrored=true)
-        @test_throws ArgumentError VIConfig(optimizer_options=(; a=1), kl_minimize=(; b=2))
 
         simple_lh = GaussianLikelihood([0.0]; precision=[1.0])
+        problem = VariationalProblem(
+            simple_lh,
+            [0.0];
+            family=MGVIFamily(),
+            divergence=ReverseKL(),
+            optimizer=NewtonCG(),
+            config=cfg,
+        )
+        @test problem.adtype isa GeoVI.ADTypes.AutoFiniteDiff
+        @test problem.n_base_draws == 3
+        @test problem.optimizer_options.maxiter == 20
+        problem_state = initialize_vi(problem, MersenneTwister(2))
+        @test problem_state.iteration == 0
+        @test problem_state.rng isa MersenneTwister
+
         @test_throws ArgumentError update_nonlinear_residual(simple_lh, [0.0], [0.0])
         @test_throws ArgumentError fit(
             simple_lh,
@@ -269,21 +281,19 @@ using Random
         posterior_metric = I + A' * Diagonal(precision) * A
 
         rng_metric = MersenneTwister(11)
-        metric_draw, metric_info = draw_linear_residual(lh, xi, rng_metric; from_inverse=false)
-        @test metric_info.converged
-        @test metric_info.iterations == 0
+        metric_draw = draw_metric_sample(lh, xi, rng_metric)
 
         rng_residual = MersenneTwister(11)
-        residual, residual_info = draw_linear_residual(
+        residual_draw = draw_linear_residual(
             lh,
             xi,
             rng_residual;
             cg_rtol=1e-12,
             cg_maxiter=10,
         )
-        @test residual_info.converged
-        @test residual_info.iterations > 0
-        @test residual ≈ posterior_metric \ metric_draw atol = 1e-10 rtol = 1e-10
+        @test residual_draw.info.converged
+        @test residual_draw.info.iterations > 0
+        @test residual_draw.residual ≈ posterior_metric \ metric_draw.metric atol = 1e-10 rtol = 1e-10
 
         @test_throws ErrorException draw_linear_residual(
             lh,
@@ -292,24 +302,24 @@ using Random
             cg_maxiter=0,
         )
 
-        stalled_residual, stalled_info = draw_linear_residual(
+        stalled_draw = draw_linear_residual(
             lh,
             xi,
             MersenneTwister(11);
             cg_maxiter=0,
             throw_on_failure=false,
         )
-        @test !stalled_info.converged
-        @test stalled_info.iterations == 0
-        @test size(stalled_residual) == size(xi)
+        @test !stalled_draw.info.converged
+        @test stalled_draw.info.iterations == 0
+        @test size(stalled_draw.residual) == size(xi)
 
         n_draws = 4_000
         draws = Matrix{eltype(xi)}(undef, 2, n_draws)
         rng = MersenneTwister(23)
         for i in 1:n_draws
-            draw, info = draw_linear_residual(lh, xi, rng; cg_rtol=1e-10, cg_maxiter=10)
-            @test info.converged
-            draws[:, i] = draw
+            draw = draw_linear_residual(lh, xi, rng; cg_rtol=1e-10, cg_maxiter=10)
+            @test draw.info.converged
+            draws[:, i] = draw.residual
         end
 
         mean_draw = vec(sum(draws; dims=2) ./ n_draws)
@@ -334,33 +344,30 @@ using Random
         xi = [0.2, -0.1]
 
         rng = MersenneTwister(11)
-        metric_sample, prior_sample = GeoVI._draw_metric_sample(lh, xi, rng)
-        linear_residual, linear_info = draw_linear_residual(
+        metric_sample = draw_metric_sample(lh, xi, rng)
+        linear_draw = draw_linear_residual(
             lh,
             xi,
-            rng;
-            metric_sample=metric_sample,
-            x0=prior_sample,
+            metric_sample;
             cg_rtol=1e-12,
             cg_maxiter=10,
         )
 
-        @test linear_info.converged
+        @test linear_draw.info.converged
 
-        updated_residual, update_info = update_nonlinear_residual(
+        update = update_nonlinear_residual(
             lh,
             xi,
-            linear_residual;
-            metric_sample=metric_sample,
+            linear_draw;
             optimizer_options=(; xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10),
         )
 
-        @test update_info.converged
-        @test updated_residual ≈ linear_residual atol = 1e-12 rtol = 1e-12
-        @test norm(update_info.gradient) < 1e-12
-        @test update_info.value < 1e-24
+        @test update.result.converged
+        @test update.residual ≈ linear_draw.residual atol = 1e-12 rtol = 1e-12
+        @test norm(update.result.gradient) < 1e-12
+        @test update.result.value < 1e-24
 
-        mirrored_residuals, mirrored_info = draw_residual(
+        mirrored_draw = draw_residual(
             lh,
             xi,
             MersenneTwister(11);
@@ -368,24 +375,24 @@ using Random
             optimizer_options=(; xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10),
         )
 
-        @test size(mirrored_residuals) == (2, length(xi))
-        @test mirrored_info.linear.converged
-        @test mirrored_info.positive.converged
-        @test mirrored_info.negative.converged
-        @test mirrored_residuals[1, :] ≈ linear_residual atol = 1e-12 rtol = 1e-12
-        @test mirrored_residuals[2, :] ≈ -linear_residual atol = 1e-12 rtol = 1e-12
-        @test norm(mirrored_residuals[1, :] + mirrored_residuals[2, :]) < 1e-12
+        @test size(mirrored_draw.residuals) == (2, length(xi))
+        @test mirrored_draw.linear.info.converged
+        @test mirrored_draw.positive.result.converged
+        @test mirrored_draw.negative.result.converged
+        @test mirrored_draw.residuals[1, :] ≈ linear_draw.residual atol = 1e-12 rtol = 1e-12
+        @test mirrored_draw.residuals[2, :] ≈ -linear_draw.residual atol = 1e-12 rtol = 1e-12
+        @test norm(mirrored_draw.residuals[1, :] + mirrored_draw.residuals[2, :]) < 1e-12
 
-        adam_initial_residual = linear_residual .+ [0.25, -0.2]
+        adam_initial_residual = linear_draw.residual .+ [0.25, -0.2]
         trafo_at_point = transformation(lh, xi)
         adam_initial_value, adam_initial_gradient = GeoVI._nonlinear_residual_value_and_gradient(
             lh,
             xi,
             trafo_at_point,
-            metric_sample,
+            metric_sample.metric,
             xi .+ adam_initial_residual,
         )
-        adam_residual, adam_info = update_nonlinear_residual(
+        adam_update = update_nonlinear_residual(
             lh,
             xi,
             adam_initial_residual;
@@ -394,11 +401,11 @@ using Random
             optimizer_options=(; maxiter=400, miniter=50, xtol=1e-10, absdelta=1e-12),
         )
 
-        @test adam_info.converged
-        @test adam_info.optimizer_state !== nothing
-        @test adam_info.value < adam_initial_value
-        @test norm(adam_info.gradient) < norm(adam_initial_gradient)
-        @test adam_residual ≈ linear_residual atol = 1e-3 rtol = 1e-3
+        @test adam_update.result.converged
+        @test adam_update.result.optimizer_state !== nothing
+        @test adam_update.result.value < adam_initial_value
+        @test norm(adam_update.result.gradient) < norm(adam_initial_gradient)
+        @test adam_update.residual ≈ linear_draw.residual atol = 1e-3 rtol = 1e-3
 
         toy_base = GaussianLikelihood([0.0]; precision=[4.0])
         toy_forward(x) = x .+ 0.25 .* x .^ 3
@@ -415,52 +422,48 @@ using Random
         toy_xi = [0.35]
 
         toy_rng = MersenneTwister(7)
-        toy_metric_sample, toy_prior_sample = GeoVI._draw_metric_sample(toy_lh, toy_xi, toy_rng)
-        toy_linear_residual, toy_linear_info = draw_linear_residual(
+        toy_metric_sample = draw_metric_sample(toy_lh, toy_xi, toy_rng)
+        toy_linear_draw = draw_linear_residual(
             toy_lh,
             toy_xi,
-            toy_rng;
-            metric_sample=toy_metric_sample,
-            x0=toy_prior_sample,
+            toy_metric_sample;
             cg_rtol=1e-12,
             cg_maxiter=20,
         )
 
-        @test toy_linear_info.converged
+        @test toy_linear_draw.info.converged
 
         toy_trafo_at_point = transformation(toy_lh, toy_xi)
         initial_value, initial_gradient = GeoVI._nonlinear_residual_value_and_gradient(
             toy_lh,
             toy_xi,
             toy_trafo_at_point,
-            toy_metric_sample,
-            toy_xi .+ toy_linear_residual,
+            toy_metric_sample.metric,
+            toy_xi .+ toy_linear_draw.residual,
         )
 
-        toy_updated_residual, toy_update_info = update_nonlinear_residual(
+        toy_update = update_nonlinear_residual(
             toy_lh,
             toy_xi,
-            toy_linear_residual;
-            metric_sample=toy_metric_sample,
+            toy_linear_draw;
             optimizer_options=(; maxiter=20, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=20),
         )
 
-        @test toy_update_info.converged
-        @test toy_update_info.value < initial_value
-        @test norm(toy_update_info.gradient) < norm(initial_gradient)
-        @test abs(toy_updated_residual[1] - toy_linear_residual[1]) > 1e-4
+        @test toy_update.result.converged
+        @test toy_update.result.value < initial_value
+        @test norm(toy_update.result.gradient) < norm(initial_gradient)
+        @test abs(toy_update.residual[1] - toy_linear_draw.residual[1]) > 1e-4
 
-        skipped_residual, skipped_info = update_nonlinear_residual(
+        skipped_update = update_nonlinear_residual(
             toy_lh,
             toy_xi,
-            toy_linear_residual;
-            metric_sample=toy_metric_sample,
+            toy_linear_draw;
             optimizer_options=(; maxiter=0),
         )
 
-        @test skipped_residual == toy_linear_residual
-        @test skipped_info.skipped
-        @test skipped_info.iterations == 0
+        @test skipped_update.residual == toy_linear_draw.residual
+        @test skipped_update.result.skipped
+        @test skipped_update.result.iterations == 0
     end
 
     @testset "outer VI loop" begin
@@ -476,21 +479,25 @@ using Random
             optimizer_options=(; maxiter=12, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10, fd_eps=1e-6),
         )
 
-        step_state = initialize_vi(MersenneTwister(5); config=mgvi_cfg)
-        step_samples, step_state = step_vi(
+        mgvi_problem = VariationalProblem(
             lh,
-            xi0,
-            MGVIFamily(),
-            ReverseKL(),
-            NewtonCG(),
-            step_state,
-            mgvi_cfg,
+            xi0;
+            family=MGVIFamily(),
+            divergence=ReverseKL(),
+            optimizer=NewtonCG(),
+            config=mgvi_cfg,
         )
+        step_state = initialize_vi(mgvi_problem, MersenneTwister(5))
+        step_samples, step_state = step_vi(mgvi_problem, xi0, step_state)
         @test step_state.iteration == 1
         @test step_state.sample_state.family isa MGVIFamily
         @test step_state.minimization_state.converged
         @test length(step_samples) == 8
         @test length(step_samples.keys) == 4
+
+        mgvi_problem_samples, mgvi_problem_state = fit(mgvi_problem; rng=MersenneTwister(5))
+        @test mgvi_problem_state.iteration == mgvi_cfg.n_iterations
+        @test mgvi_problem_samples.position ≈ analytic_mean atol = 0.2 rtol = 0.0
 
         mgvi_samples, mgvi_state = fit(
             lh,
@@ -517,7 +524,7 @@ using Random
             optimizer_options=(; maxiter=12, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10, fd_eps=1e-6),
         )
 
-        geovi_samples, geovi_state = optimize_vi(
+        geovi_samples, geovi_state = fit(
             lh,
             xi0;
             family=GeoVIFamily(),
@@ -532,7 +539,7 @@ using Random
         @test length(geovi_samples) == geovi_cfg.n_samples
         @test geovi_samples.position ≈ analytic_mean atol = 0.2 rtol = 0.0
 
-        alias_samples, alias_state = optimize_kl(
+        alias_samples, alias_state = fit(
             lh,
             xi0;
             family=MGVIFamily(),
@@ -589,31 +596,20 @@ using Random
             mirrored=true,
             optimizer_options=(; maxiter=1, xtol=0.0, fd_eps=1e-6),
         )
-        adam_step_state0 = initialize_vi(MersenneTwister(12); config=adam_step_cfg)
-        adam_step1, adam_step_state1 = step_vi(
+        adam_problem = VariationalProblem(
             lh,
-            xi0,
-            MGVIFamily(),
-            ReverseKL(),
-            adam,
-            adam_step_state0,
-            adam_step_cfg,
+            xi0;
+            family=MGVIFamily(),
+            divergence=ReverseKL(),
+            optimizer=adam,
+            config=adam_step_cfg,
         )
-        adam_step2, adam_step_state2 = step_vi(
-            lh,
-            adam_step1,
-            MGVIFamily(),
-            ReverseKL(),
-            adam,
-            adam_step_state1,
-            adam_step_cfg,
-        )
+        adam_step_state0 = initialize_vi(adam_problem, MersenneTwister(12))
+        adam_step1, adam_step_state1 = step_vi(adam_problem, xi0, adam_step_state0)
+        adam_step2, adam_step_state2 = step_vi(adam_problem, adam_step1, adam_step_state1)
         fresh_second = GeoVI._update_position(
-            lh,
-            ReverseKL(),
-            adam,
+            adam_problem,
             Samples(adam_step1.position, nothing; keys=nothing),
-            adam_step_cfg,
             nothing,
         )
         @test adam_step_state1.minimization_state.optimizer_state !== nothing
@@ -640,25 +636,17 @@ using Random
                 optimizer_options=(; maxiter=1, xtol=0.0, fd_eps=1f-4),
             )
 
-            state0 = initialize_vi(Reactant.ReactantRNG(); config=cfg)
-            samples1, state1 = step_vi(
+            problem = VariationalProblem(
                 lh,
-                xi0,
-                MGVIFamily(),
-                ReverseKL(),
-                optimizer,
-                state0,
-                cfg,
+                xi0;
+                family=MGVIFamily(),
+                divergence=ReverseKL(),
+                optimizer=optimizer,
+                config=cfg,
             )
-            samples2, state2 = step_vi(
-                lh,
-                samples1,
-                MGVIFamily(),
-                ReverseKL(),
-                optimizer,
-                state1,
-                cfg,
-            )
+            state0 = initialize_vi(problem, Reactant.ReactantRNG())
+            samples1, state1 = step_vi(problem, xi0, state0)
+            samples2, state2 = step_vi(problem, samples1, state1)
 
             @test state1.iteration == 1
             @test state2.iteration == 2

@@ -47,7 +47,7 @@ abstract type AbstractVariationalFamily end
 To add a new family, subtype `AbstractVariationalFamily` and implement
 
 ```julia
-_draw_sample_block(::YourFamily, optimizer, lh, position, rng, config)
+_draw_sample_block(problem, ::YourFamily, position, rng)
 ```
 
 returning a sample block and auxiliary sampler info.
@@ -57,18 +57,14 @@ returning a sample block and auxiliary sampler info.
 The current divergence surface is:
 
 ```julia
-abstract type AbstractDivergence end
-const AbstractFDivergence = AbstractDivergence
+abstract type AbstractFDivergence end
 ```
 
-`AbstractFDivergence` is the preferred public alias going forward, while
-`AbstractDivergence` remains available for compatibility.
-
-To add a new divergence, subtype `AbstractDivergence` and implement:
+To add a new divergence, subtype `AbstractFDivergence` and implement:
 
 ```julia
-_kl_value(::YourDivergence, lh, position, residuals)
-_kl_metric(::YourDivergence, lh, position, residuals, v)
+_fdivergence_value(::YourDivergence, lh, position, residuals)
+_fdivergence_fishermetric(::YourDivergence, lh, position, residuals, v)
 ```
 
 The first method provides the scalar objective minimized by `fit`, and the
@@ -103,8 +99,7 @@ _optimize(
 )
 ```
 
-The return value should match the tuple-like optimization result currently used
-by `NewtonCG` and the `Optimisers.jl` adapter.
+The return value should be an `OptimizationResult`.
 
 If the backend carries state across outer VI iterations, also implement:
 
@@ -114,6 +109,20 @@ _optimizer_state(optimizer::YourOptimizer, x0, previous_result)
 
 For simple stateless optimizers, the default `_optimizer_state` method is
 enough.
+
+## Problem Setup
+
+The preferred way to prepare the outer VI loop is:
+
+```julia
+problem = VariationalProblem(lh, xi0; family, divergence, optimizer, config)
+state = initialize_vi(problem, rng)
+samples, state = step_vi(problem, state)
+samples, state = fit(problem; rng)
+```
+
+`VariationalProblem` resolves the AD backend and normalizes the relevant option
+sets once, instead of repeating that work inside each VI iteration.
 
 ## AD Backends
 

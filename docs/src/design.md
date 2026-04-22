@@ -173,10 +173,9 @@ abstract type AbstractVariationalFamily end
 struct MGVIFamily <: AbstractVariationalFamily end
 struct GeoVIFamily <: AbstractVariationalFamily end
 
-abstract type AbstractDivergence end
-const AbstractFDivergence = AbstractDivergence
-struct ReverseKL <: AbstractDivergence end
-struct ForwardKL <: AbstractDivergence end
+abstract type AbstractFDivergence end
+struct ReverseKL <: AbstractFDivergence end
+struct ForwardKL <: AbstractFDivergence end
 
 abstract type AbstractOptimizer end
 struct NewtonCG <: AbstractOptimizer end
@@ -196,6 +195,19 @@ struct VIState{R,S,M}
     rng::R
     sample_state::S
     minimization_state::M
+end
+
+struct VariationalProblem{L,S,F,D,O,C,AD,DL,NU,OO}
+    likelihood::L
+    initial_samples::S
+    family::F
+    divergence::D
+    optimizer::O
+    config::C
+    adtype::AD
+    draw_linear_options::DL
+    nonlinear_update_options::NU
+    optimizer_options::OO
 end
 ```
 
@@ -219,8 +231,9 @@ These mirror the paper and `nifty.re`, and give us a clean way to test the
 pieces independently.
 
 ```julia
-draw_linear_residual(lh, xi, rng; kwargs...)
-update_nonlinear_residual(lh, xi, residual, rng; kwargs...)
+draw_metric_sample(lh, xi, rng)
+draw_linear_residual(lh, xi, rng_or_metric_sample; kwargs...)
+update_nonlinear_residual(lh, xi, linear_draw; kwargs...)
 draw_residual(lh, xi, rng; kwargs...)
 ```
 
@@ -235,20 +248,13 @@ Intended meaning:
 Proposed high-level driver:
 
 ```julia
-initialize_vi(rng; config::VIConfig)
-step_vi(lh, samples, family, divergence, optimizer, state, config)
-fit([rng], lh, xi0, family, divergence, optimizer; config::VIConfig)
+problem = VariationalProblem(lh, xi0; family, divergence, optimizer, config)
+initialize_vi(problem, rng)
+step_vi(problem, samples, state)
+fit(problem; rng)
 ```
 
-And for compatibility with the NIFTy mental model, I would also keep:
-
-```julia
-optimize_vi(args...; kwargs...) = fit(args...; kwargs...)
-optimize_kl(args...; kwargs...) = fit(args...; kwargs...)
-```
-
-This makes `fit` the public entry point while still preserving the paper and
-NIFTy vocabulary as aliases.
+This keeps `fit` as the public entry point without carrying older aliases.
 
 ## Example User Flow
 
