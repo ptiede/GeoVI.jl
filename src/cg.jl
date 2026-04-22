@@ -67,23 +67,20 @@ function ConjugateGradient(; rtol=1e-8, atol=0.0, maxiter=nothing, miniter=0)
     )
 end
 
-function solve(cg::ConjugateGradient, operator, b; x0=nothing)
-    maxiter = cg.maxiter === nothing ? max(20, 2 * length(b)) : cg.maxiter
-
+function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
     x = x0 === nothing ? zero(b) : copy(x0)
     r = b .- operator(x)
     p = copy(r)
 
     rr = real(dot(r, r))
     residual_norm = sqrt(rr)
-    threshold = max(float(cg.atol), float(cg.rtol) * norm(b))
 
     iteration = 0
     keep_going = true
     converged = false
     breakdown = false
 
-    @trace if (residual_norm <= threshold) & (cg.miniter == 0)
+    @trace if (residual_norm <= threshold) & (miniter == 0)
         keep_going = false
         converged = true
     end
@@ -100,7 +97,7 @@ function solve(cg::ConjugateGradient, operator, b; x0=nothing)
         iteration += ifelse(valid_step, 1, 0)
         breakdown = breakdown | breakdown_step
 
-        cg_keep_going, converged = _check_conv(iteration, cg.miniter, residual_norm, threshold)
+        cg_keep_going, converged = _check_conv(iteration, miniter, residual_norm, threshold)
         keep_going = valid_step & cg_keep_going
     end
     return x, _cg_info(
@@ -109,4 +106,11 @@ function solve(cg::ConjugateGradient, operator, b; x0=nothing)
         residual_norm=residual_norm,
         breakdown=breakdown,
     )
+end
+
+function solve(cg::ConjugateGradient, operator, b; x0=nothing)
+    miniter = cg.miniter
+    maxiter = cg.maxiter === nothing ? max(20, 2 * length(b)) : cg.maxiter
+    threshold = max(float(cg.atol), float(cg.rtol) * norm(b))
+    return _cg_run(operator, b, maxiter, miniter, threshold; x0=x0)
 end

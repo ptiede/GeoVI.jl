@@ -12,6 +12,17 @@ using ReactantCore: @trace
 
 const _ReactantArray = Union{Reactant.ConcreteRArray,Reactant.TracedRArray}
 
+function Reactant.traced_type_inner(
+    ::Type{GeoVI.ConjugateGradient},
+    seen,
+    ::Reactant.TraceMode,
+    ::Type,
+    ndevices,
+    runtime,
+)
+    return GeoVI.ConjugateGradient
+end
+
 function Reactant.make_tracer(
     seen,
     prev::GeoVI.ConjugateGradient,
