@@ -2,7 +2,7 @@ module GeoVIReactantExt
 
 import ADTypes
 import GeoVI
-import GeoVI: _check_objective_value, _outer_vi_value_and_gradient, _run_optimizer_rule
+import GeoVI: _outer_vi_value_and_gradient
 import LinearAlgebra: dot, norm
 import Optimisers
 import Random: AbstractRNG
@@ -96,34 +96,6 @@ function _reactant_strip_state(state::GeoVI.VIState)
         sample_state=state.sample_state,
         minimization_state=minimization_state,
     )
-end
-
-function _evaluate_outer_vi_candidate(
-    step_valid,
-    value,
-    grad,
-    new_x,
-    objective_evaluations,
-    objective_state,
-)
-    adtype, divergence, likelihood, residuals, fd_eps = objective_state
-    new_value = value
-    new_grad = grad
-    value_valid = false
-    evaluations = objective_evaluations
-    @trace if step_valid
-        new_value, new_grad = _outer_vi_value_and_gradient(
-            adtype,
-            divergence,
-            likelihood,
-            residuals,
-            new_x;
-            fd_eps=fd_eps,
-        )
-        evaluations += 1
-        value_valid = _check_objective_value(new_value)
-    end
-    return new_value, new_grad, value_valid, evaluations
 end
 
 function _forward_to!(y, x, forward)
@@ -248,34 +220,39 @@ function GeoVI._update_position(
         samples.position,
         optimizer_state,
     )
+    x = samples.position
     value, grad = _outer_vi_value_and_gradient(
         problem.adtype,
         problem.divergence,
         problem.likelihood,
         samples.residuals,
-        samples.position;
+        x;
         fd_eps=problem.optimizer_options.fd_eps,
     )
-    return _run_optimizer_rule(
-        problem.optimizer,
-        state,
-        samples.position,
-        value,
-        grad;
-        maxiter=problem.optimizer_options.maxiter,
-        miniter=problem.optimizer_options.miniter,
-        xtol=problem.optimizer_options.xtol,
-        absdelta=problem.optimizer_options.absdelta,
-        stepnorm=norm,
-        objective_evaluations=1,
-        evaluate_candidate=_evaluate_outer_vi_candidate,
-        evaluation_state=(
+    maxiter = problem.optimizer_options.maxiter
+
+    @trace for _ in 1:maxiter
+        state, x = GeoVI._optimizer_update(state, x, grad)
+        value, grad = _outer_vi_value_and_gradient(
             problem.adtype,
             problem.divergence,
             problem.likelihood,
             samples.residuals,
-            problem.optimizer_options.fd_eps,
-        ),
+            x;
+            fd_eps=problem.optimizer_options.fd_eps,
+        )
+    end
+
+    return GeoVI._optimization_result(
+        problem.optimizer;
+        x=x,
+        converged=maxiter > 0,
+        status=maxiter > 0 ? 0 : maxiter,
+        value=value,
+        gradient=grad,
+        iterations=maxiter,
+        objective_evaluations=maxiter + 1,
+        optimizer_state=state,
     )
 end
 

@@ -67,6 +67,17 @@ function ConjugateGradient(; rtol=1e-8, atol=0.0, maxiter=nothing, miniter=0)
     )
 end
 
+function _cg_iterate(operator, rr, x, r, p, iteration, breakdown, miniter, threshold)
+    Ap = operator(p)
+    denom = real(dot(p, Ap))
+    x, r, p, rr, residual_norm, valid_step, breakdown_step = _cg_step(denom, rr, x, r, p, Ap)
+    iteration += ifelse(valid_step, 1, 0)
+    breakdown = breakdown | breakdown_step
+    keep_going, converged = _check_conv(iteration, miniter, residual_norm, threshold)
+    keep_going = valid_step & keep_going
+    return rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm
+end
+
 function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
     x = x0 === nothing ? zero(b) : copy(x0)
     r = b .- operator(x)
@@ -90,15 +101,8 @@ function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
     end
 
     @trace while keep_going & (iteration < maxiter)
-        Ap = operator(p)
-        denom = real(dot(p, Ap))
-        x, r, p, rr, residual_norm, valid_step, breakdown_step =
-            _cg_step(denom, rr, x, r, p, Ap)
-        iteration += ifelse(valid_step, 1, 0)
-        breakdown = breakdown | breakdown_step
-
-        cg_keep_going, converged = _check_conv(iteration, miniter, residual_norm, threshold)
-        keep_going = valid_step & cg_keep_going
+        rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm =
+            _cg_iterate(operator, rr, x, r, p, iteration, breakdown, miniter, threshold)
     end
     return x, _cg_info(
         converged=converged,
