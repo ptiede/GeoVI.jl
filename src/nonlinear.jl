@@ -123,7 +123,7 @@ function update_nonlinear_residual(
             metric_sample_array,
             x,
         ),
-        hessp=(x, v) -> _nonlinear_residual_metric(lh, expansion_point, x, v),
+        metricp=(x, v) -> _nonlinear_residual_metric(lh, expansion_point, x, v),
         maxiter=maxiter,
         miniter=_option(optimizer_options, :miniter, 0),
         xtol=_option(optimizer_options, :xtol, 1e-5),

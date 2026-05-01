@@ -7,7 +7,7 @@ _option(options, name::Symbol, default) =
 Marker supertype for built-in optimizer backends.
 
 To add a new optimizer backend, subtype `AbstractOptimizer` and implement
-`_optimize(optimizer, x0; fun_and_grad, hessp, kwargs...)`. If the backend
+`_optimize(optimizer, x0; fun_and_grad, metricp, kwargs...)`. If the backend
 needs persistent state across VI iterations, also implement
 `_optimizer_state(optimizer, x0, previous_result)`.
 
@@ -292,7 +292,7 @@ function _line_search_step(
         out_direction, out_oe_inc
 end
 
-function _line_search(direction0, x, value, grad, fun_and_grad, hessp)
+function _line_search(direction0, x, value, grad, fun_and_grad, metricp)
     α = one(eltype(x))
     accepted = false
     ls_steps = 0
@@ -302,8 +302,8 @@ function _line_search(direction0, x, value, grad, fun_and_grad, hessp)
     direction = copy(direction0)
     oe_inc = 0
 
-    Hg = hessp(x, grad)
-    curvature = real(dot(grad, Hg))
+    Mg = metricp(x, grad)
+    curvature = real(dot(grad, Mg))
     grad_norm_sq = real(dot(grad, grad))
     valid_curve = curvature > 0
     safe_curvature = _select_scalar(valid_curve, curvature, one(curvature))
@@ -331,15 +331,15 @@ end
 function _newton_cg_iter(
     active, x, value, grad, status, iterations, converged,
     objective_evaluations, hessian_evaluations, line_search_steps,
-    cg, hessp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
+    cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
 )
-    step, cg_info = solve(cg, v -> hessp(x, v), grad)
+    step, cg_info = solve(cg, v -> metricp(x, v), grad)
     cg_ok = cg_info.converged
     cg_iters = cg_info.iterations
 
     new_x_ls, new_value_ls, new_grad_ls, accepted, α, direction_used,
         ls_steps, he_inc, oe_inc =
-        _line_search(step, x, value, grad, fun_and_grad, hessp)
+        _line_search(step, x, value, grad, fun_and_grad, metricp)
 
     energy_diff = value - new_value_ls
     step_size = α * stepnorm(direction_used)
@@ -390,7 +390,7 @@ function _optimize(
     optimizer::NewtonCG,
     x0::AbstractArray;
     fun_and_grad,
-    hessp,
+    metricp,
     maxiter::Integer=20,
     miniter::Integer=0,
     xtol::Real=1e-5,
@@ -437,7 +437,7 @@ function _optimize(
             _newton_cg_iter(
                 active, x, value, grad, status, iterations, converged,
                 objective_evaluations, hessian_evaluations, line_search_steps,
-                cg, hessp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
+                cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
             )
     end
 
@@ -459,7 +459,7 @@ function _optimize(
     optimizer::Optimisers.AbstractRule,
     x0::AbstractArray;
     fun_and_grad,
-    hessp=nothing,
+    metricp=nothing,
     maxiter::Integer=20,
     miniter::Integer=0,
     xtol::Real=1e-5,

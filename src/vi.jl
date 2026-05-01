@@ -492,7 +492,7 @@ function _update_position(
             x;
             fd_eps=fd_eps,
         ),
-        hessp=(x, v) -> _outer_vi_metric(divergence, likelihood, residuals, x, v),
+        metricp=(x, v) -> _outer_vi_metric(divergence, likelihood, residuals, x, v),
         maxiter=problem.optimizer_options.maxiter,
         miniter=problem.optimizer_options.miniter,
         xtol=problem.optimizer_options.xtol,

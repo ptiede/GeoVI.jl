@@ -85,7 +85,7 @@ _optimize(
     optimizer::YourOptimizer,
     x0::AbstractArray;
     fun_and_grad,
-    hessp,
+    metricp,
     maxiter,
     miniter,
     xtol,
