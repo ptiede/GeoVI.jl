@@ -9,6 +9,17 @@ using Test
 using LinearAlgebra
 using Optimisers
 using Random
+using Statistics: mean
+
+function _linear_gaussian_setup(rng; D=100, M=50, σ²=0.25)
+    A = randn(rng, M, D) ./ sqrt(D)
+    ξ_true = randn(rng, D)
+    data = A * ξ_true .+ sqrt(σ²) .* randn(rng, M)
+    precision = fill(1 / σ², M)
+    Σ_post = inv(I + (A' * A) ./ σ²)
+    μ_post = Σ_post * (A' * data) ./ σ²
+    return (; A, data, precision, ξ_true, σ², Σ_post, μ_post)
+end
 
 @testset "GeoVI.jl" begin
     @testset "array utilities" begin
@@ -617,45 +628,106 @@ using Random
         @test abs(adam_step2.position[1] - fresh_second.x[1]) > 1e-8
     end
 
+    @testset "linear-Gaussian conjugate end-to-end" begin
+        rng = MersenneTwister(0xa11ce)
+        D, M = 100, 50
+        setup = _linear_gaussian_setup(rng; D=D, M=M, σ²=0.25)
+        forward = ξ -> setup.A * ξ
+        lh = compose(GaussianLikelihood(setup.data; precision=setup.precision), forward)
+        xi0 = zeros(D)
+
+        cfg = VIConfig(
+            n_iterations=8,
+            n_samples=128,
+            mirrored=true,
+            draw_linear=(; cg_rtol=1e-10, cg_maxiter=200),
+            optimizer_options=(; maxiter=20, xtol=1e-9, cg_rtol=1e-10, cg_maxiter=200, fd_eps=1e-6),
+        )
+
+        for family in (MGVIFamily(), GeoVIFamily())
+            samples, state = fit(
+                lh,
+                xi0;
+                family=family,
+                divergence=ReverseKL(),
+                optimizer=NewtonCG(),
+                config=cfg,
+                rng=MersenneTwister(2025),
+            )
+            @test state.iteration == cfg.n_iterations
+            @test samples.position ≈ setup.μ_post atol = 0.1 rtol = 0.0
+
+            draws = posterior_samples(samples)
+            @test size(draws) == (cfg.n_samples, D)
+            @test vec(mean(draws; dims=1)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
+
+            centered = draws .- mean(draws; dims=1)
+            tr_emp = sum(abs2, centered) / cfg.n_samples
+            @test tr_emp ≈ tr(setup.Σ_post) rtol = 0.25
+        end
+    end
+
     @testset "Reactant extension" begin
         if !HAS_REACTANT
             @info "Skipping Reactant tests because `Reactant` is not available in the active environment."
         else
-            data = Reactant.to_rarray(Float32[2.0])
-            precision = Reactant.to_rarray(Float32[4.0])
-            xi0 = Reactant.to_rarray(Float32[0.0])
-            lh = GaussianLikelihood(data; precision=precision)
-            optimizer = Optimisers.Adam(0.05f0)
+            rng = MersenneTwister(0xb0b)
+            D, M = 64, 32
+            setup = _linear_gaussian_setup(rng; D=D, M=M, σ²=0.25)
+            A_r = Reactant.to_rarray(Float32.(setup.A))
+            data_r = Reactant.to_rarray(Float32.(setup.data))
+            precision_r = Reactant.to_rarray(Float32.(setup.precision))
+            xi0_r = Reactant.to_rarray(zeros(Float32, D))
+            forward = ξ -> A_r * ξ
+            lh = compose(
+                GaussianLikelihood(data_r; precision=precision_r),
+                forward;
+                adtype=GeoVI.ADTypes.AutoEnzyme(),
+            )
 
             cfg = VIConfig(
-                n_iterations=0,
-                n_samples=2,
+                n_iterations=8,
+                n_samples=128,
                 mirrored=true,
-                adtype=GeoVI.ADTypes.AutoFiniteDiff(),
-                draw_linear=(; cg_rtol=1f-5, cg_maxiter=10),
-                optimizer_options=(; maxiter=1, xtol=0.0, fd_eps=1f-4),
+                adtype=GeoVI.ADTypes.AutoEnzyme(),
+                draw_linear=(; cg_rtol=1.0f-6, cg_maxiter=200),
+                optimizer_options=(; maxiter=20, xtol=1.0f-6, fd_eps=1.0f-4),
             )
 
             problem = VariationalProblem(
                 lh,
-                xi0;
+                xi0_r;
                 family=MGVIFamily(),
                 divergence=ReverseKL(),
-                optimizer=optimizer,
+                optimizer=NewtonCG(),
                 config=cfg,
             )
-            state0 = initialize_vi(problem, Reactant.ReactantRNG())
-            samples1, state1 = step_vi(problem, xi0, state0)
-            samples2, state2 = step_vi(problem, samples1, state1)
 
-            @test state1.iteration == 1
-            @test state2.iteration == 2
-            @test length(samples1) == cfg.n_samples
-            @test state1.cache !== nothing
-            @test nameof(typeof(state1.cache)) == :ReactantVIStepCache
-            @test state2.cache === state1.cache
-            @test state1.minimization_state.optimizer_state !== nothing
-            @test state2.minimization_state.optimizer_state !== nothing
+            samples, state = fit(problem; rng=MersenneTwister(0xfeed))
+            @test state.iteration == cfg.n_iterations
+            @test state.rng isa Reactant.ReactantRNG
+            @test state.cache isa GeoVI.ADTypes.AutoReactant ||
+                  nameof(typeof(state.cache)) == :ReactantVIStepCache
+
+            position_host = Array(samples.position)
+            @test position_host ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
+
+            draws_host = Array(posterior_samples(samples))
+            @test size(draws_host) == (cfg.n_samples, D)
+            @test vec(mean(draws_host; dims=1)) ≈ Float32.(setup.μ_post) atol = 0.25 rtol = 0.0
+
+            centered = draws_host .- mean(draws_host; dims=1)
+            tr_emp = sum(abs2, centered) / cfg.n_samples
+            @test tr_emp ≈ tr(setup.Σ_post) rtol = 0.35
+
+            bypass_state = GeoVI.VIState(
+                iteration=0,
+                rng=MersenneTwister(0),
+                sample_state=nothing,
+                minimization_state=nothing,
+                cache=nothing,
+            )
+            @test_throws ArgumentError step_vi(problem, xi0_r, bypass_state)
         end
     end
 end

@@ -221,25 +221,30 @@ function GeoVI._update_position(
         optimizer_state,
     )
     x = samples.position
-    value, grad = _outer_vi_value_and_gradient(
-        problem.adtype,
-        problem.divergence,
-        problem.likelihood,
-        samples.residuals,
-        x;
-        fd_eps=problem.optimizer_options.fd_eps,
-    )
+    residuals = samples.residuals
+    adtype = problem.adtype
+    divergence = problem.divergence
+    likelihood = problem.likelihood
+    fd_eps = problem.optimizer_options.fd_eps
     maxiter = problem.optimizer_options.maxiter
+    value, grad = _outer_vi_value_and_gradient(
+        adtype,
+        divergence,
+        likelihood,
+        residuals,
+        x;
+        fd_eps=fd_eps,
+    )
 
     @trace for _ in 1:maxiter
         state, x = GeoVI._optimizer_update(state, x, grad)
         value, grad = _outer_vi_value_and_gradient(
-            problem.adtype,
-            problem.divergence,
-            problem.likelihood,
-            samples.residuals,
+            adtype,
+            divergence,
+            likelihood,
+            residuals,
             x;
-            fd_eps=problem.optimizer_options.fd_eps,
+            fd_eps=fd_eps,
         )
     end
 
@@ -256,14 +261,23 @@ function GeoVI._update_position(
     )
 end
 
+GeoVI._wrap_rng(::ADTypes.AutoReactant, rng::Reactant.ReactantRNG) = rng
+function GeoVI._wrap_rng(::ADTypes.AutoReactant, rng::AbstractRNG)
+    seed = rand(rng, UInt64, 2)
+    return Reactant.ReactantRNG(Reactant.to_rarray(seed))
+end
+
 function GeoVI._step_vi(
-    adtype::ADTypes.AutoReactant,
+    ::ADTypes.AutoReactant,
     problem::GeoVI.VariationalProblem,
     samples::GeoVI.Samples,
     state::GeoVI.VIState,
 )
-    state.rng isa Reactant.ReactantRNG ||
-        return GeoVI._step_vi_default(problem, samples, state)
+    state.rng isa Reactant.ReactantRNG || throw(ArgumentError(
+        "AutoReactant requires `state.rng::Reactant.ReactantRNG`; got $(typeof(state.rng)). " *
+        "Use `initialize_vi(problem, rng)` (which auto-wraps any AbstractRNG) or " *
+        "construct `Reactant.ReactantRNG()` directly.",
+    ))
 
     stripped_state = _reactant_strip_state(state)
     signature = (typeof(problem), typeof(samples), typeof(stripped_state))
@@ -283,7 +297,13 @@ function GeoVI._step_vi(
         samples,
         stripped_state,
     )
-    return new_samples, GeoVI._restore_cache(new_state, cache)
+    advanced_state = GeoVI.VIState(
+        iteration=state.iteration + 1,
+        rng=new_state.rng,
+        sample_state=new_state.sample_state,
+        minimization_state=new_state.minimization_state,
+    )
+    return new_samples, GeoVI._restore_cache(advanced_state, cache)
 end
 
 end

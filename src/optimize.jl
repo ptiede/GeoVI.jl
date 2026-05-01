@@ -254,6 +254,138 @@ function _run_optimizer_rule(
     )
 end
 
+_select_scalar(pred, a, b) = ifelse(pred, a, b)
+function _select_array(pred, a, b)
+    T = eltype(a)
+    p = ifelse(pred, one(T), zero(T))
+    return p .* a .+ (one(T) - p) .* b
+end
+
+function _line_search_step(
+    ls_it, accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc,
+    x, value, grad, fun_and_grad, valid_curve, curvature_direction,
+)
+    will_act = !accepted
+    trial_x = x .- α .* direction
+    trial_value, trial_grad = fun_and_grad(trial_x)
+
+    inc = _select_scalar(will_act, 1, 0)
+    out_oe_inc = oe_inc + inc
+    out_ls_steps = ls_steps + inc
+
+    is_good = isfinite(trial_value) & (trial_value <= value)
+    will_accept = will_act & is_good
+    out_accepted = accepted | will_accept
+
+    out_new_x = _select_array(will_accept, trial_x, new_x)
+    out_new_value = _select_scalar(will_accept, trial_value, new_value)
+    out_new_grad = _select_array(will_accept, trial_grad, new_grad)
+
+    bad = will_act & !is_good
+    α_after_halve = _select_scalar(bad, α / 2, α)
+
+    switch = bad & (ls_it == 5) & valid_curve
+    out_α = _select_scalar(switch, one(α), α_after_halve)
+    out_direction = _select_array(switch, curvature_direction, direction)
+
+    return out_accepted, out_α, out_ls_steps, out_new_x, out_new_value, out_new_grad,
+        out_direction, out_oe_inc
+end
+
+function _line_search(direction0, x, value, grad, fun_and_grad, hessp)
+    α = one(eltype(x))
+    accepted = false
+    ls_steps = 0
+    new_x = copy(x)
+    new_value = value + zero(value)
+    new_grad = copy(grad)
+    direction = copy(direction0)
+    oe_inc = 0
+
+    Hg = hessp(x, grad)
+    curvature = real(dot(grad, Hg))
+    grad_norm_sq = real(dot(grad, grad))
+    valid_curve = curvature > 0
+    safe_curvature = _select_scalar(valid_curve, curvature, one(curvature))
+    curvature_direction = (grad_norm_sq / safe_curvature) .* grad
+    he_inc = 1
+
+    if within_compile()
+        α = promote_to_traced(α)
+        accepted = promote_to_traced(accepted)
+        ls_steps = promote_to_traced(ls_steps)
+        oe_inc = promote_to_traced(oe_inc)
+    end
+
+    @trace for ls_it in 0:8
+        (accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc) =
+            _line_search_step(
+                ls_it, accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc,
+                x, value, grad, fun_and_grad, valid_curve, curvature_direction,
+            )
+    end
+
+    return new_x, new_value, new_grad, accepted, α, direction, ls_steps, he_inc, oe_inc
+end
+
+function _newton_cg_iter(
+    active, x, value, grad, status, iterations, converged,
+    objective_evaluations, hessian_evaluations, line_search_steps,
+    cg, hessp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
+)
+    step, cg_info = solve(cg, v -> hessp(x, v), grad)
+    cg_ok = cg_info.converged
+    cg_iters = cg_info.iterations
+
+    new_x_ls, new_value_ls, new_grad_ls, accepted, α, direction_used,
+        ls_steps, he_inc, oe_inc =
+        _line_search(step, x, value, grad, fun_and_grad, hessp)
+
+    energy_diff = value - new_value_ls
+    step_size = α * stepnorm(direction_used)
+    done_by_energy = absdelta === nothing ?
+        false :
+        ((0 <= energy_diff) & (energy_diff < absdelta))
+    convergence_hit = (iteration > miniter) & (done_by_energy | (step_size <= xtol))
+
+    progressed = active & cg_ok & accepted
+    deactivate_now = active & ((!cg_ok) | (cg_ok & !accepted) | (progressed & convergence_hit))
+
+    new_active = active & !deactivate_now
+    new_x = _select_array(progressed, new_x_ls, x)
+    new_value = _select_scalar(progressed, new_value_ls, value)
+    new_grad = _select_array(progressed, new_grad_ls, grad)
+
+    cg_failed_now = active & !cg_ok
+    ls_failed_now = active & cg_ok & !accepted
+    converged_now = progressed & convergence_hit
+
+    new_iterations = _select_scalar(
+        cg_failed_now | ls_failed_now, iteration - 1,
+        _select_scalar(progressed, iteration, iterations),
+    )
+
+    new_status = _select_scalar(
+        cg_failed_now, -2,
+        _select_scalar(
+            ls_failed_now, -1,
+            _select_scalar(converged_now, 0, status),
+        ),
+    )
+
+    new_converged = converged | converged_now
+
+    active_int = _select_scalar(active, 1, 0)
+    cg_ok_int = _select_scalar(active & cg_ok, 1, 0)
+
+    new_oe = objective_evaluations + active_int * (cg_ok_int * oe_inc)
+    new_he = hessian_evaluations + active_int * (cg_iters + cg_ok_int * he_inc)
+    new_lss = line_search_steps + cg_ok_int * ls_steps
+
+    return new_active, new_x, new_value, new_grad, new_status, new_iterations, new_converged,
+        new_oe, new_he, new_lss
+end
+
 function _optimize(
     optimizer::NewtonCG,
     x0::AbstractArray;
@@ -300,69 +432,13 @@ function _optimize(
     active = true
 
     @trace for iteration in 1:maxiter
-        if active
-            step, cg_info = solve(cg, v -> hessp(x, v), grad)
-            hessian_evaluations += cg_info.iterations
-
-            if !cg_info.converged
-                status = -2
-                iterations = iteration - 1
-                active = false
-            else
-                direction = step
-                α = one(eltype(x))
-                accepted = false
-                ls_steps = 0
-                new_x, new_value, new_grad = x, value, grad
-
-                @trace for ls_it in 0:8
-                    if !accepted
-                        trial_x = x .- α .* direction
-                        trial_value, trial_grad = fun_and_grad(trial_x)
-                        objective_evaluations += 1
-                        ls_steps += 1
-
-                        if isfinite(trial_value) && trial_value <= value
-                            new_x, new_value, new_grad = trial_x, trial_value, trial_grad
-                            accepted = true
-                        else
-                            α /= 2
-                            if ls_it == 5
-                                Hg = hessp(x, grad)
-                                hessian_evaluations += 1
-                                curvature = real(dot(grad, Hg))
-                                if curvature > 0
-                                    α = one(α)
-                                    direction = (real(dot(grad, grad)) / curvature) .* grad
-                                end
-                            end
-                        end
-                    end
-                end
-                line_search_steps += ls_steps
-
-                if !accepted
-                    status = -1
-                    iterations = iteration - 1
-                    active = false
-                else
-                    energy_diff = value - new_value
-                    step_size = α * stepnorm(direction)
-                    x, value, grad = new_x, new_value, new_grad
-                    iterations = iteration
-
-                    if iteration > miniter
-                        done_by_energy =
-                            absdelta === nothing ? false : (0 <= energy_diff < absdelta)
-                        if done_by_energy || step_size <= xtol
-                            converged = true
-                            status = 0
-                            active = false
-                        end
-                    end
-                end
-            end
-        end
+        (active, x, value, grad, status, iterations, converged,
+         objective_evaluations, hessian_evaluations, line_search_steps) =
+            _newton_cg_iter(
+                active, x, value, grad, status, iterations, converged,
+                objective_evaluations, hessian_evaluations, line_search_steps,
+                cg, hessp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
+            )
     end
 
     return _optimization_result(

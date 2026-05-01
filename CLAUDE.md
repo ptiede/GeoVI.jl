@@ -14,6 +14,8 @@ julia --project
 julia> include("test/runtests.jl")
 ```
 
+The full suite lives in a single `test/runtests.jl` with nested `@testset` blocks. To run only one group, comment out siblings or wrap the desired block in its own `@testset` and `include` it from the REPL — there is no per-file test runner.
+
 ### Formatting
 The project uses [Runic.jl](https://github.com/fredrikekre/Runic.jl) for code formatting:
 ```bash
@@ -34,7 +36,10 @@ GeoVI implements variational inference using Fisher-metric geometry. The key ass
 
 4. **Outer VI loop** (`src/vi.jl`) — Coordinates sampling and position optimization. `fit(problem)` runs the full loop; `step_vi(problem, samples, state)` runs one iteration. `VIConfig` holds all hyperparameters.
 
-5. **Reactant extension** (`ext/GeoVIReactantExt.jl`) — Compiles the VI step via Reactant for GPU/TPU. Loaded automatically when `Reactant` is available; uses `AutoReactant` AD backend. Caches compiled steps in `ReactantVIStepCache`.
+5. **AD/compilation extensions** (`ext/`) —
+   - `GeoVIEnzymeExt.jl` provides `pushforward`/`_value_and_gradient` via Enzyme (`AutoEnzyme`).
+   - `GeoVIReactantExt.jl` compiles the VI step via Reactant for GPU/TPU; uses `AutoReactant` and caches compiled steps in `ReactantVIStepCache`.
+   Both load automatically when their package is available. Code in `src/cg.jl` uses `ReactantCore.@trace` so the inner CG works under both eager and traced execution — preserve that when editing.
 
 ### Key types
 

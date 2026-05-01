@@ -160,9 +160,11 @@ function VariationalProblem(
     )
 end
 
+_wrap_rng(_adtype, rng) = rng
+
 initialize_vi(rng; config::VIConfig) = VIState(iteration=0, rng=rng)
 initialize_vi(problem::VariationalProblem, rng::AbstractRNG=Random.default_rng()) =
-    VIState(iteration=0, rng=rng)
+    VIState(iteration=0, rng=_wrap_rng(problem.adtype, rng))
 
 function _single_sample_block(residual::AbstractArray)
     return reshape(residual, (1, size(residual)...))
