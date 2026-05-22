@@ -86,10 +86,17 @@ function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
     rr = real(dot(r, r))
     residual_norm = sqrt(rr)
 
-    iteration = 0
-    keep_going = true
-    converged = false
-    breakdown = false
+    # Promote loop-carried scalar state to TracedRNumber inside a Reactant
+    # trace so the `@trace while` below can use `track_numbers=false`. With
+    # `track_numbers=false`, Reactant won't try to derive traced versions of
+    # any plain `Int`/`Bool` it encounters while walking the closure
+    # environment (e.g. `LinRange.len::Int`, `Frequencies.n::Int`),
+    # avoiding parametric-type-mismatch errors when the loop closure
+    # reaches into a heavyweight forward model.
+    iteration = _maybe_traced(0)
+    keep_going = _maybe_traced(true)
+    converged = _maybe_traced(false)
+    breakdown = _maybe_traced(false)
 
     @trace if (residual_norm <= threshold) & (miniter == 0)
         keep_going = false
@@ -100,7 +107,7 @@ function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
         keep_going = false
     end
 
-    @trace while keep_going & (iteration < maxiter)
+    @trace track_numbers = false while keep_going & (iteration < maxiter)
         rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm =
             _cg_iterate(operator, rr, x, r, p, iteration, breakdown, miniter, threshold)
     end
@@ -111,6 +118,14 @@ function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
         breakdown=breakdown,
     )
 end
+
+# Identity outside a Reactant trace; inside, lifts a Julia scalar to a
+# `TracedRNumber` so loop-carried state already has the trace-side
+# representation before `@trace while`/`@trace for` is entered with
+# `track_numbers=false`. Defined as a top-level (not closure-local)
+# function so dispatch is stable inside the trace.
+@inline _maybe_traced(x) = ReactantCore.within_compile() ?
+    ReactantCore.promote_to_traced(x) : x
 
 function solve(cg::ConjugateGradient, operator, b; x0=nothing)
     miniter = cg.miniter

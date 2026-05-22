@@ -236,7 +236,10 @@ function GeoVI._update_position(
         fd_eps=fd_eps,
     )
 
-    @trace for _ in 1:maxiter
+    # `track_numbers=false` so Reactant doesn't walk every reachable Number
+    # in the closure environment (the metric/likelihood closes over the
+    # full forward model — see GeoVI/src/cg.jl for the rationale).
+    @trace track_numbers = false for _ in 1:maxiter
         state, x = GeoVI._optimizer_update(state, x, grad)
         value, grad = _outer_vi_value_and_gradient(
             adtype,

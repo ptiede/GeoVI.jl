@@ -210,7 +210,14 @@ function _run_optimizer_rule(
     converged = maxiter == 0
     status = converged ? 0 : maxiter
 
-    @trace while keep_going & (iteration < maxiter)
+    if within_compile()
+        iteration = promote_to_traced(iteration)
+        keep_going = promote_to_traced(keep_going)
+        converged = promote_to_traced(converged)
+        status = promote_to_traced(status)
+    end
+
+    @trace track_numbers = false while keep_going & (iteration < maxiter)
         state, new_x = _optimizer_update(state, x, grad)
         delta = new_x .- x
         step_size = stepnorm(delta)
@@ -317,7 +324,7 @@ function _line_search(direction0, x, value, grad, fun_and_grad, metricp)
         oe_inc = promote_to_traced(oe_inc)
     end
 
-    @trace for ls_it in 0:8
+    @trace track_numbers = false for ls_it in 0:8
         (accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc) =
             _line_search_step(
                 ls_it, accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc,
@@ -431,7 +438,14 @@ function _optimize(
     iterations = 0
     active = true
 
-    @trace for iteration in 1:maxiter
+    if within_compile()
+        active = promote_to_traced(active)
+        converged = promote_to_traced(converged)
+        status = promote_to_traced(status)
+        iterations = promote_to_traced(iterations)
+    end
+
+    @trace track_numbers = false for iteration in 1:maxiter
         (active, x, value, grad, status, iterations, converged,
          objective_evaluations, hessian_evaluations, line_search_steps) =
             _newton_cg_iter(
