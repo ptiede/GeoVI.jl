@@ -35,17 +35,23 @@ end
 function _optimization_result(
     optimizer;
     x,
-    converged::Bool,
+    converged,
     status,
     value,
     gradient,
-    iterations::Integer,
-    objective_evaluations::Integer,
-    hessian_evaluations::Integer=0,
-    line_search_steps::Integer=0,
+    iterations,
+    objective_evaluations,
+    hessian_evaluations=0,
+    line_search_steps=0,
     optimizer_state=nothing,
-    skipped::Bool=false,
+    skipped=false,
 )
+    # No type-coercion / eager `Int(...)` casts: inside a Reactant trace,
+    # the counters arrive as `TracedRNumber{Int}` and the `converged`
+    # flag as `TracedRNumber{Bool}` (see the `_optimize` /
+    # `_run_optimizer_rule` loops that promote via `_maybe_traced` /
+    # `promote_to_traced`). The `OptimizationResult` struct is generic
+    # so storing either host or traced numbers is fine.
     return OptimizationResult(
         optimizer,
         optimizer_state,
@@ -55,10 +61,10 @@ function _optimization_result(
         status,
         value,
         gradient,
-        Int(iterations),
-        Int(objective_evaluations),
-        Int(hessian_evaluations),
-        Int(line_search_steps),
+        iterations,
+        objective_evaluations,
+        hessian_evaluations,
+        line_search_steps,
     )
 end
 
@@ -215,6 +221,7 @@ function _run_optimizer_rule(
         keep_going = promote_to_traced(keep_going)
         converged = promote_to_traced(converged)
         status = promote_to_traced(status)
+        objective_evaluations = promote_to_traced(objective_evaluations)
     end
 
     @trace track_numbers = false while keep_going & (iteration < maxiter)
@@ -443,6 +450,9 @@ function _optimize(
         converged = promote_to_traced(converged)
         status = promote_to_traced(status)
         iterations = promote_to_traced(iterations)
+        objective_evaluations = promote_to_traced(objective_evaluations)
+        hessian_evaluations = promote_to_traced(hessian_evaluations)
+        line_search_steps = promote_to_traced(line_search_steps)
     end
 
     @trace track_numbers = false for iteration in 1:maxiter

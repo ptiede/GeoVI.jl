@@ -6,7 +6,10 @@ struct ConjugateGradientInfo{C,I,R,B}
 end
 
 function _cg_info(; converged, iterations, residual_norm, breakdown=false)
-    return ConjugateGradientInfo(converged, Int(iterations), residual_norm, breakdown)
+    # `iterations` may be a plain `Int` (host call) or a `Reactant.TracedRNumber{Int}`
+    # (inside a Reactant trace, after the `_maybe_traced` promotion in `_cg_run`).
+    # Avoid eagerly casting to `Int` so both paths work; the struct is generic.
+    return ConjugateGradientInfo(converged, iterations, residual_norm, breakdown)
 end
 
 function _check_denom(denom)

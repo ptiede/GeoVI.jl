@@ -17,7 +17,11 @@ _sample_count(residuals::AbstractArray) = size(residuals, 1)
 
 Base.length(samples::Samples) = samples.residuals === nothing ? 0 : _sample_count(samples.residuals)
 
-function _sample_slice(x::AbstractArray, i::Int)
+function _sample_slice(x::AbstractArray, i)
+    # Note: `i` is an integer-typed scalar. We omit a `::Integer`
+    # annotation because under `@trace for` it arrives as a
+    # `Reactant.TracedRNumber{<:Integer}`, which does not subtype
+    # `Integer`. The implementation is identical in either case.
     tail = ntuple(_ -> Colon(), max(ndims(x) - 1, 0))
     return x[i, tail...]
 end

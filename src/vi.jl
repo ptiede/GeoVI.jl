@@ -177,9 +177,9 @@ function _allocate_sample_residuals(block::AbstractArray, n_blocks::Integer)
     return similar(block, (n_blocks * _sample_block_size(block), trailing_dims...))
 end
 
-function _write_sample_block!(dest::AbstractArray, i::Integer, block::AbstractArray)
+function _write_sample_block!(dest::AbstractArray, i, block::AbstractArray)
     block_size = _sample_block_size(block)
-    first = (Int(i) - 1) * block_size + 1
+    first = (i - 1) * block_size + 1
     last = first + block_size - 1
     trailing = ntuple(_ -> Colon(), max(ndims(block) - 1, 0))
     dest[first:last, trailing...] = block
@@ -287,7 +287,11 @@ function _draw_samples(
     residuals = _allocate_sample_residuals(first_block, problem.n_base_draws)
     _write_sample_block!(residuals, 1, first_block)
 
-    for i in 2:problem.n_base_draws
+    # `@trace for` so the n-fold sample draws compile to a single MLIR
+    # while-loop body instead of (n_base_draws - 1) unrolled copies of the
+    # full CG + forward model graph.
+    n = problem.n_base_draws
+    @trace track_numbers = false for i in 2:n
         block, _ = _draw_sample_block(problem, problem.family, position, rng)
         _write_sample_block!(residuals, i, block)
     end
@@ -299,7 +303,9 @@ end
 _negative_logposterior(lh::AbstractLikelihood, x::AbstractArray) =
     -logdensity(lh, x) + 0.5 * real(dot(x, x))
 
-function _sample_position(position::AbstractArray, residuals::AbstractArray, i::Int)
+function _sample_position(position::AbstractArray, residuals::AbstractArray, i)
+    # `i` may be a `Reactant.TracedRNumber{<:Integer}` under `@trace for`;
+    # see the comment on `_sample_slice`.
     return _sample_slice(residuals, i) .+ position
 end
 
@@ -313,8 +319,20 @@ function _fdivergence_value(
 
     value = zero(eltype(position))
     n = _sample_count(residuals)
-    for i in 1:n
-        value += _negative_logposterior(lh, _sample_position(position, residuals, i))
+    # `@trace for` (rather than a plain Julia for) so the n-fold Monte
+    # Carlo sum compiles to a single MLIR while-loop body instead of n
+    # trace-time-unrolled iterations. Each iter does a full forward
+    # through `lh` (e.g. a VLBI NUFT) that registers O(10) broadcast
+    # functions; unrolled across n samples those compound against
+    # Reactant's per-name uniquing cap of 10000 for
+    # `<f>_broadcast_scalar`.
+    #
+    # `track_numbers = false` keeps the deep type-walk away from plain
+    # Int/Bool fields in the closure environment. `value` is already a
+    # `TracedRNumber` here (via `zero(eltype(position))` when
+    # `position::AnyTracedRArray`), so no explicit promotion is needed.
+    @trace track_numbers = false for i in 1:n
+        value = value + _negative_logposterior(lh, _sample_position(position, residuals, i))
     end
     return value / n
 end
@@ -417,7 +435,11 @@ function _fdivergence_fishermetric(
 
     result = zero(v)
     n = _sample_count(residuals)
-    for i in 1:n
+    # `@trace for` so the n-fold metric-application sum compiles to a
+    # single MLIR while-loop body. Same rationale as `_fdivergence_value`
+    # above. `result` enters as a `TracedRNumber{T}`-eltype array when
+    # `v::AnyTracedRArray`, so no scalar promotion is needed.
+    @trace track_numbers = false for i in 1:n
         result = result .+ _posterior_metric(
             lh,
             _sample_position(position, residuals, i),
