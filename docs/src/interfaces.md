@@ -38,19 +38,40 @@ Notes:
 
 ## Variational Families
 
-Variational families are lightweight markers:
+A variational family defines *how a sample is drawn from the variational
+distribution* `q`, and carries the solvers that draw needs (but no
+outer-optimization or Monte-Carlo-budget knobs):
 
 ```julia
 abstract type AbstractVariationalFamily end
 ```
 
+The built-in families are `MGVIFamily(; solver=ConjugateGradient(...))` and
+`GeoVIFamily(; solver=ConjugateGradient(...), curve=NewtonCG(...))`.
+
 To add a new family, subtype `AbstractVariationalFamily` and implement
 
 ```julia
-_draw_sample_block(problem, ::YourFamily, position, rng)
+_draw_sample_block(family::YourFamily, lh, position, rng, mirrored)
+_draw_one_residual(family::YourFamily, lh, position, rng)
 ```
 
-returning a sample block and auxiliary sampler info.
+The first returns a (possibly mirrored) sample block plus auxiliary sampler
+info and is used during fitting; the second returns a single residual and backs
+`rand` on a `VariationalPosterior`. Both consume the family's own stored solvers.
+
+## Estimators
+
+The Monte-Carlo estimator owns how many sample nodes approximate the divergence
+expectation `E_q[·]` — a property of the expectation, not the family:
+
+```julia
+abstract type AbstractEstimator end
+```
+
+The built-in estimator is `MCEstimator(; n_samples, mirrored)`. To add a new
+estimator, subtype `AbstractEstimator` and provide `_n_base_draws` and a
+`draw_residuals(family, estimator, lh, position, rng)` method.
 
 ## Divergences
 
@@ -60,23 +81,27 @@ The current divergence surface is:
 abstract type AbstractFDivergence end
 ```
 
-To add a new divergence, subtype `AbstractFDivergence` and implement:
+To add a new divergence, subtype `AbstractFDivergence` and implement, dispatching
+**jointly on the family and the divergence**:
 
 ```julia
-_fdivergence_value(::YourDivergence, lh, position, residuals)
-_fdivergence_fishermetric(::YourDivergence, lh, position, residuals, v)
+_fdivergence_value(family, ::YourDivergence, lh, position, residuals)
+_fdivergence_fishermetric(family, ::YourDivergence, lh, position, residuals, v)
 ```
 
 The first method provides the scalar objective minimized by `fit`, and the
 second provides the associated Fisher-metric action used by second-order
-optimizers.
+optimizers. The joint `family × divergence` dispatch lets a scheme ship its own
+objective.
 
 ## Optimizers
 
-GeoVI accepts two optimizer families:
+GeoVI accepts, as the outer position optimizer:
 
-- built-in optimizers that subtype `AbstractOptimizer`
-- any `Optimisers.AbstractRule`
+- built-in optimizers that subtype `AbstractOptimizer` (`NewtonCG`), which run to
+  convergence within one position update
+- a bare `Optimisers.AbstractRule` (e.g. `Optimisers.Adam(0.05)`), which takes a
+  single gradient step per `step_vi!` — the user's loop provides the iterations
 
 To add a new built-in optimizer, subtype `AbstractOptimizer` and implement:
 
@@ -112,17 +137,27 @@ enough.
 
 ## Problem Setup
 
-The preferred way to prepare the outer VI loop is:
+A `VariationalProblem` bundles the likelihood with the four orthogonal axes
+(`family`, `divergence`, `estimator`, `optimizer`) plus the AD backend:
 
 ```julia
-problem = VariationalProblem(lh, xi0; family, divergence, optimizer, config)
-state = initialize_vi(problem, rng)
-samples, state = step_vi(problem, state)
-samples, state = fit(problem; rng)
+problem = VariationalProblem(lh, xi0; family, divergence, estimator, optimizer, adtype)
 ```
 
-`VariationalProblem` resolves the AD backend and normalizes the relevant option
-sets once, instead of repeating that work inside each VI iteration.
+The primary loop is in place: the user owns the iteration count.
+
+```julia
+rng, state = init(rng, problem)   # state: one mutable, fully preallocated VIState
+for _ in 1:n
+    step_vi!(rng, problem, state) # mutates state and its buffers in place
+end
+post = posterior(problem, state)
+```
+
+`fit(problem, n; rng)` is a convenience that runs the loop and returns the
+`VariationalPosterior`. `VariationalProblem` resolves the AD backend once (e.g.
+inferring `AutoReactant` from a Reactant array position). Under Reactant the
+in-place step is compiled, tracing the mutation directly.
 
 ## AD Backends
 

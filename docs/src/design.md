@@ -163,65 +163,55 @@ Notes:
 - `posterior_samples(samples)` should return `position .+ residuals`
 - both `position` and `residuals` are dense arrays in the current design
 
-### VI configuration and state
+### Four orthogonal axes
 
-Instead of a large hidden optimizer backend, I would make the algorithm mostly
-functional and carry any optimizer state explicitly.
+The VI step decomposes into four orthogonal axes, passed directly to
+`VariationalProblem` (there is no monolithic config object). Each axis is a small
+self-describing object:
 
 ```julia
+# (1) family: how to draw one sample from q, plus the solvers the draw needs.
 abstract type AbstractVariationalFamily end
-struct MGVIFamily <: AbstractVariationalFamily end
-struct GeoVIFamily <: AbstractVariationalFamily end
+struct MGVIFamily{S}   <: AbstractVariationalFamily; solver::S; end          # linear draw
+struct GeoVIFamily{S,C} <: AbstractVariationalFamily; solver::S; curve::C; end # + nonlinear curve
 
+# (2) estimator: how many Monte-Carlo nodes estimate E_q[·] (family-agnostic).
+abstract type AbstractEstimator end
+struct MCEstimator <: AbstractEstimator; n_samples::Int; mirrored::Bool; end
+
+# (3) optimizer: the OUTER position update only.
+abstract type AbstractOptimizer end
+struct NewtonCG{T,A,C} <: AbstractOptimizer end       # carries flat CG keywords
+# a bare Optimisers.jl rule is also accepted: one gradient step per step_vi!
+
+# (4) divergence: the objective form; dispatches jointly with the family.
 abstract type AbstractFDivergence end
 struct ReverseKL <: AbstractFDivergence end
 struct ForwardKL <: AbstractFDivergence end
 
-abstract type AbstractOptimizer end
-struct NewtonCG <: AbstractOptimizer end
-
-struct VIConfig{AD,DL,NU,OO}
-    adtype::AD
-    n_iterations::Int
-    n_samples::Int
-    mirrored::Bool
-    draw_linear::DL
-    nonlinear_update::NU
-    optimizer_options::OO
-end
-
-struct VIState{R,S,M}
-    iteration::Int
-    rng::R
-    sample_state::S
-    minimization_state::M
-end
-
-struct VariationalProblem{L,S,F,D,O,C,AD,DL,NU,OO}
+struct VariationalProblem{L,S,F,D,E,O,AD}
     likelihood::L
     initial_samples::S
     family::F
     divergence::D
+    estimator::E
     optimizer::O
-    config::C
     adtype::AD
-    draw_linear_options::DL
-    nonlinear_update_options::NU
-    optimizer_options::OO
 end
 ```
 
-Here `optimizer` can be either our built-in `NewtonCG()` or a standard
-`Optimisers.jl` rule such as `Optimisers.Adam()`.
+The key separation: the linear-draw CG tolerance and the geoVI curve are
+*family-specific draw machinery* (they live on the family); `n_samples`/`mirrored`
+are *Monte-Carlo estimator* knobs (they live on `MCEstimator`); and the outer
+`optimizer` governs only the position update. `ConjugateGradient` is user-facing
+only as a family `solver`; inside `NewtonCG` the CG is configured by flat keywords.
 
-Important proposed departure from `nifty.re`:
+Important departure from `nifty.re`:
 
-- `n_samples` should mean the final number of stored samples, not the number of
-  random seeds before mirroring.
-- if `mirrored=true`, require `iseven(n_samples)` and internally use
-  `n_samples ÷ 2` seeds
-
-That removes a very easy source of confusion from the Python implementation.
+- `n_samples` means the final number of stored samples, not the number of random
+  seeds before mirroring.
+- if `mirrored=true`, `MCEstimator` requires `iseven(n_samples)` and internally
+  uses `n_samples ÷ 2` seeds.
 
 ## Public Algorithm Entry Points
 
@@ -245,20 +235,24 @@ Intended meaning:
 
 ### Outer VI loop
 
-Proposed high-level driver:
+The primary interface is the in-place loop (the user owns the iteration count):
 
 ```julia
-problem = VariationalProblem(lh, xi0; family, divergence, optimizer, config)
-initialize_vi(problem, rng)
-step_vi(problem, samples, state)
-fit(problem; rng)
+problem = VariationalProblem(lh, xi0; family, divergence, estimator, optimizer, adtype)
+rng, state = init(rng, problem)   # state: one mutable, fully preallocated VIState
+for _ in 1:n
+    step_vi!(rng, problem, state) # mutates state and its buffers in place
+end
+post = posterior(problem, state)  # a VariationalPosterior
 ```
 
-This keeps `fit` as the public entry point without carrying older aliases.
+`fit(problem, n; rng)` is a convenience that runs the loop and returns the
+posterior. Under Reactant the in-place step is compiled (Reactant traces the
+mutation directly).
 
 ## Example User Flow
 
-This is the kind of surface API I think we should target first:
+This is the surface API we target:
 
 ```julia
 using GeoVI
@@ -270,30 +264,27 @@ forward(xi) = A * exp.(xi)
 lh = GaussianLikelihood(data; precision = inv_noise_cov)
 posterior_lh = compose(lh, forward)
 
-cfg = VIConfig(
-    adtype = ADTypes.AutoEnzyme(),
-    n_iterations = 8,
-    n_samples = 8,
-    mirrored = true,
-    draw_linear = (; cg_maxiter = 100, cg_tol = 1e-4),
-    nonlinear_update = (; maxiter = 5, xtol = 1e-4),
-    optimizer_options = (; maxiter = 35, xtol = 1e-4),
+problem = VariationalProblem(
+    posterior_lh,
+    xi0;
+    family    = GeoVIFamily(; solver = ConjugateGradient(rtol = 1e-4, maxiter = 100),
+                             curve  = NewtonCG(maxiter = 5, xtol = 1e-4)),
+    divergence= ReverseKL(),
+    estimator = MCEstimator(; n_samples = 8, mirrored = true),
+    optimizer = NewtonCG(maxiter = 35, xtol = 1e-4),
+    adtype    = ADTypes.AutoEnzyme(),
 )
 
-samples, state = fit(
-    rng,
-    posterior_lh,
-    xi0,
-    GeoVIFamily(),
-    ReverseKL(),
-    Optimisers.Adam(0.05);
-    config = cfg,
-)
-draws = posterior_samples(samples)
+post  = fit(problem, 8; rng)        # returns a VariationalPosterior
+draws = rand(rng, post, 100)        # draw arbitrarily many new samples
+μ     = mean(post)                  # the latent mean
 ```
 
-This should remain valid whether the differentiation engine is finite
-differences, Enzyme, or later `ADTypes.AutoReactant()`.
+This remains valid whether the differentiation engine is finite differences,
+Enzyme, or `ADTypes.AutoReactant()` (inferred from a Reactant array position).
+An `Optimisers.jl` rule may be used as the outer optimizer directly
+(`optimizer = Optimisers.Adam(0.05)`); it takes one gradient step per
+`step_vi!`, so the iteration count is the user's outer loop.
 
 ## ADTypes + Reactant Positioning
 
@@ -352,7 +343,7 @@ etc.) in the public API. Those should stay internal helper machinery.
 
 ### Phase 4: Outer VI loop
 
-- `step_vi`
+- `step_vi!`
 - `fit`
 - sample reuse / resampling policy
 - optimizer and divergence plumbing

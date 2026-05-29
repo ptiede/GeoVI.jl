@@ -2,7 +2,6 @@ module GeoVIReactantExt
 
 import ADTypes
 import GeoVI
-import GeoVI: _outer_vi_value_and_gradient
 import LinearAlgebra: dot, norm
 import Optimisers
 import Random: AbstractRNG
@@ -10,35 +9,22 @@ import Reactant
 using Reactant: @compile, @jit
 using ReactantCore: @trace
 
-const _ReactantArray = Union{Reactant.ConcreteRArray,Reactant.TracedRArray}
+const _ReactantArray = Union{Reactant.ConcreteRArray, Reactant.TracedRArray}
 
-function Reactant.traced_type_inner(
-    ::Type{GeoVI.ConjugateGradient},
-    seen,
-    ::Reactant.TraceMode,
-    ::Type,
-    ndevices,
-    runtime,
-)
-    return GeoVI.ConjugateGradient
+# Note: the family/optimizer/estimator/ConjugateGradient config structs need no
+# `make_tracer`/`traced_type_inner` pass-through hooks. They flow into the
+# compiled `_vi_step!` as arguments, but Reactant treats their plain
+# Int/Float64/Bool fields as compile-time constants, and the hot loops use
+# `@trace ... track_numbers=false` so the deep number-walk is suppressed there.
+
+# Holds the compiled in-place step. Built once at `init` (see `_init_cache`)
+# for the exact preallocated buffers, so `step` is a concrete compiled thunk —
+# no `Any`, no recompilation on the first iteration.
+struct ReactantVIStepCache{F}
+    step::F
 end
 
-function Reactant.make_tracer(
-    seen,
-    prev::GeoVI.ConjugateGradient,
-    path,
-    mode;
-    kwargs...,
-)
-    return prev
-end
-
-mutable struct ReactantVIStepCache
-    compiled_step::Any
-    signature::Any
-end
-
-struct ReactantOptimizerState{R,S}
+struct ReactantOptimizerState{R, S}
     rule::R
     state::S
 end
@@ -54,18 +40,18 @@ function _reactant_optimizer_state(state::ReactantOptimizerState)
 end
 
 function GeoVI._optimizer_state(
-    optimizer::Optimisers.AbstractRule,
-    x0,
-    previous_state::ReactantOptimizerState,
-)
+        optimizer::Optimisers.AbstractRule,
+        x0,
+        previous_state::ReactantOptimizerState,
+    )
     return previous_state
 end
 
 function GeoVI._prepare_optimizer_state(
-    optimizer::Optimisers.AbstractRule,
-    x0::_ReactantArray,
-    optimizer_state,
-)
+        optimizer::Optimisers.AbstractRule,
+        x0::_ReactantArray,
+        optimizer_state,
+    )
     if isnothing(optimizer_state)
         return _reactant_optimizer_state(@jit(Optimisers.setup(optimizer, x0)))
     end
@@ -73,10 +59,10 @@ function GeoVI._prepare_optimizer_state(
 end
 
 function GeoVI._optimizer_update(
-    state::ReactantOptimizerState,
-    x,
-    grad,
-)
+        state::ReactantOptimizerState,
+        x,
+        grad,
+    )
     leaf_state = _optimizer_leaf(state)
     leaf_state, new_x = Optimisers.update(leaf_state, x, grad)
     return _reactant_optimizer_state(leaf_state), new_x
@@ -84,26 +70,12 @@ end
 
 GeoVI._runtime_failure_enabled(::_ReactantArray) = !Reactant.within_compile()
 
-function _reactant_strip_state(state::GeoVI.VIState)
-    minimization_state = if state.minimization_state isa GeoVI.OptimizationResult
-        state.minimization_state.optimizer_state
-    else
-        state.minimization_state
-    end
-    return GeoVI.VIState(
-        iteration=state.iteration,
-        rng=state.rng,
-        sample_state=state.sample_state,
-        minimization_state=minimization_state,
-    )
-end
-
 function _forward_to!(y, x, forward)
     copyto!(y, forward(x))
     return nothing
 end
 
-struct _ReactantLinearization{F,X,V}
+struct _ReactantLinearization{F, X, V}
     forward::F
     x::X
     value::V
@@ -133,135 +105,65 @@ function GeoVI.pullback(lin::_ReactantLinearization, η::AbstractArray)
     return dx
 end
 
-function _compile_step_vi(
-    problem::GeoVI.VariationalProblem,
-    samples::GeoVI.Samples,
-    state::GeoVI.VIState,
-)
-    stripped_state = _reactant_strip_state(state)
-    return @compile GeoVI._step_vi_impl(problem, samples, stripped_state)
-end
-
 function GeoVI._infer_adtype(
-    adtype::ADTypes.AutoEnzyme,
-    ::Union{Reactant.ConcreteRArray,Reactant.TracedRArray},
-)
-    return ADTypes.AutoReactant(; mode=adtype)
+        adtype::ADTypes.AutoEnzyme,
+        ::Union{Reactant.ConcreteRArray, Reactant.TracedRArray},
+    )
+    return ADTypes.AutoReactant(; mode = adtype)
 end
 
 function GeoVI._infer_composed_adtype(
-    adtype::ADTypes.AutoEnzyme,
-    ::Union{Reactant.ConcreteRArray,Reactant.TracedRArray},
-)
-    return ADTypes.AutoReactant(; mode=adtype)
+        adtype::ADTypes.AutoEnzyme,
+        ::Union{Reactant.ConcreteRArray, Reactant.TracedRArray},
+    )
+    return ADTypes.AutoReactant(; mode = adtype)
 end
 
 function GeoVI._infer_adtype(
-    ::ADTypes.AutoFiniteDiff,
-    ::Union{Reactant.ConcreteRArray,Reactant.TracedRArray},
-)
+        ::ADTypes.AutoFiniteDiff,
+        ::Union{Reactant.ConcreteRArray, Reactant.TracedRArray},
+    )
     return ADTypes.AutoReactant()
 end
 
 function GeoVI._infer_composed_adtype(
-    ::ADTypes.AutoFiniteDiff,
-    ::Union{Reactant.ConcreteRArray,Reactant.TracedRArray},
-)
+        ::ADTypes.AutoFiniteDiff,
+        ::Union{Reactant.ConcreteRArray, Reactant.TracedRArray},
+    )
     return ADTypes.AutoReactant()
 end
 
 function GeoVI._infer_adtype(
-    ::ADTypes.NoAutoDiff,
-    ::Union{Reactant.ConcreteRArray,Reactant.TracedRArray},
-)
+        ::ADTypes.NoAutoDiff,
+        ::Union{Reactant.ConcreteRArray, Reactant.TracedRArray},
+    )
     return ADTypes.NoAutoDiff()
 end
 
 function GeoVI._infer_composed_adtype(
-    ::ADTypes.NoAutoDiff,
-    ::Union{Reactant.ConcreteRArray,Reactant.TracedRArray},
-)
+        ::ADTypes.NoAutoDiff,
+        ::Union{Reactant.ConcreteRArray, Reactant.TracedRArray},
+    )
     return ADTypes.NoAutoDiff()
 end
 
 function GeoVI._automatic_linearize(
-    ::ADTypes.AutoReactant,
-    forward,
-    x::AbstractArray;
-    fd_eps=1e-6,
-)
+        ::ADTypes.AutoReactant,
+        forward,
+        x::AbstractArray;
+        fd_eps = 1.0e-6,
+    )
     return _ReactantLinearization(forward, x, forward(x))
 end
 
 function GeoVI._value_and_gradient(
-    ::ADTypes.AutoReactant,
-    objective,
-    x::AbstractArray;
-    fd_eps=1e-6,
-)
+        ::ADTypes.AutoReactant,
+        objective,
+        x::AbstractArray;
+        fd_eps = 1.0e-6,
+    )
     result = Reactant.Enzyme.gradient(Reactant.Enzyme.ReverseWithPrimal, objective, x)
     return result.val, result.derivs[1]
-end
-
-GeoVI._materialize_step_position(x::_ReactantArray) = identity.(x)
-
-function GeoVI._update_position(
-    problem::GeoVI.VariationalProblem{L,S,F,D,O,C,AD,DL,NU,OO},
-    samples::GeoVI.Samples,
-    previous_minimization_state=nothing,
-) where {L,S,F,D,O<:Optimisers.AbstractRule,C,AD<:ADTypes.AutoReactant,DL,NU,OO}
-    optimizer_state = GeoVI._previous_optimizer_state(
-        problem.optimizer,
-        samples.position,
-        previous_minimization_state,
-    )
-    state = GeoVI._prepare_optimizer_state(
-        problem.optimizer,
-        samples.position,
-        optimizer_state,
-    )
-    x = samples.position
-    residuals = samples.residuals
-    adtype = problem.adtype
-    divergence = problem.divergence
-    likelihood = problem.likelihood
-    fd_eps = problem.optimizer_options.fd_eps
-    maxiter = problem.optimizer_options.maxiter
-    value, grad = _outer_vi_value_and_gradient(
-        adtype,
-        divergence,
-        likelihood,
-        residuals,
-        x;
-        fd_eps=fd_eps,
-    )
-
-    # `track_numbers=false` so Reactant doesn't walk every reachable Number
-    # in the closure environment (the metric/likelihood closes over the
-    # full forward model — see GeoVI/src/cg.jl for the rationale).
-    @trace track_numbers = false for _ in 1:maxiter
-        state, x = GeoVI._optimizer_update(state, x, grad)
-        value, grad = _outer_vi_value_and_gradient(
-            adtype,
-            divergence,
-            likelihood,
-            residuals,
-            x;
-            fd_eps=fd_eps,
-        )
-    end
-
-    return GeoVI._optimization_result(
-        problem.optimizer;
-        x=x,
-        converged=maxiter > 0,
-        status=maxiter > 0 ? 0 : maxiter,
-        value=value,
-        gradient=grad,
-        iterations=maxiter,
-        objective_evaluations=maxiter + 1,
-        optimizer_state=state,
-    )
 end
 
 GeoVI._wrap_rng(::ADTypes.AutoReactant, rng::Reactant.ReactantRNG) = rng
@@ -270,43 +172,46 @@ function GeoVI._wrap_rng(::ADTypes.AutoReactant, rng::AbstractRNG)
     return Reactant.ReactantRNG(Reactant.to_rarray(seed))
 end
 
-function GeoVI._step_vi(
-    ::ADTypes.AutoReactant,
-    problem::GeoVI.VariationalProblem,
-    samples::GeoVI.Samples,
-    state::GeoVI.VIState,
-)
-    state.rng isa Reactant.ReactantRNG || throw(ArgumentError(
-        "AutoReactant requires `state.rng::Reactant.ReactantRNG`; got $(typeof(state.rng)). " *
-        "Use `initialize_vi(problem, rng)` (which auto-wraps any AbstractRNG) or " *
-        "construct `Reactant.ReactantRNG()` directly.",
-    ))
-
-    stripped_state = _reactant_strip_state(state)
-    signature = (typeof(problem), typeof(samples), typeof(stripped_state))
-    cache = if state.cache isa ReactantVIStepCache
-        state.cache
-    else
-        ReactantVIStepCache(nothing, nothing)
-    end
-
-    if cache.compiled_step === nothing || cache.signature != signature
-        cache.compiled_step = _compile_step_vi(problem, samples, state)
-        cache.signature = signature
-    end
-
-    new_samples, new_state = cache.compiled_step(
-        problem,
-        samples,
-        stripped_state,
+function GeoVI._init_cache(
+        ::ADTypes.AutoReactant, problem::GeoVI.VariationalProblem,
+        position, residuals, rng, optimizer_state,
     )
-    advanced_state = GeoVI.VIState(
-        iteration=state.iteration + 1,
-        rng=new_state.rng,
-        sample_state=new_state.sample_state,
-        minimization_state=new_state.minimization_state,
+    rng isa Reactant.ReactantRNG || throw(
+        ArgumentError(
+            "AutoReactant requires a `Reactant.ReactantRNG`; got $(typeof(rng)). " *
+                "Pass an `AbstractRNG` to `init` (which auto-wraps it) or construct " *
+                "`Reactant.ReactantRNG()` directly.",
+        )
     )
-    return new_samples, GeoVI._restore_cache(advanced_state, cache)
+    @info "GeoVI: compiling step_vi!..."
+    t_compile = @elapsed begin
+        step = @compile GeoVI._vi_step!(problem, position, residuals, rng, optimizer_state)
+    end
+    @info "GeoVI: compilation done" t_compile
+    return ReactantVIStepCache(step)
+end
+
+function GeoVI._step_vi!(::ADTypes.AutoReactant, rng, problem::GeoVI.VariationalProblem, state::GeoVI.VIState)
+    rng isa Reactant.ReactantRNG || throw(
+        ArgumentError(
+            "AutoReactant requires the `Reactant.ReactantRNG` returned by `init`; " *
+                "got $(typeof(rng)).",
+        )
+    )
+    # The cache's compiled step was built at `init` for these exact buffers; it
+    # mutates `position`/`residuals`/`rng` in place and returns the
+    # OptimizationResult, of which we keep only the threaded optimizer state.
+    @debug "GeoVI: running compiled step..."
+    t_run = @elapsed begin
+        result = state.cache.step(
+            problem, state.position, state.residuals, rng, state.optimizer_state
+        )
+    end
+    @debug "GeoVI: compiled step done" t_run
+
+    state.optimizer_state = result.optimizer_state
+    state.iteration += 1
+    return state
 end
 
 end

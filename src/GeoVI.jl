@@ -6,6 +6,7 @@ using LogExpFunctions: log1pexp, logistic
 using Optimisers
 using Random
 using ReactantCore
+import Statistics: mean
 
 export randn_like
 export AbstractLikelihood,
@@ -25,7 +26,7 @@ export AbstractLikelihood,
     fishermetric,
     metric,
     compose
-export Samples, posterior_samples, recenter
+export Samples, posterior_samples, recenter, VariationalPosterior, posterior, mean
 export MetricSample,
     ConjugateGradientInfo,
     ConjugateGradient,
@@ -42,15 +43,17 @@ export AbstractVariationalFamily,
     ForwardKL,
     AbstractOptimizer,
     NewtonCG,
-    VIConfig,
+    AbstractEstimator,
+    MCEstimator,
     VariationalProblem,
     VIState,
-    initialize_vi,
+    init,
     draw_metric_sample,
     draw_linear_residual,
     update_nonlinear_residual,
     draw_residual,
-    step_vi,
+    draw_residuals,
+    step_vi!,
     fit
 
 include("tree_utils.jl")

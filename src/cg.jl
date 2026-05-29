@@ -130,9 +130,11 @@ end
 @inline _maybe_traced(x) = ReactantCore.within_compile() ?
     ReactantCore.promote_to_traced(x) : x
 
-function solve(cg::ConjugateGradient, operator, b; x0=nothing)
+function solve(cg::ConjugateGradient, operator, b; x0=nothing, threshold=nothing)
     miniter = cg.miniter
     maxiter = cg.maxiter === nothing ? max(20, 2 * length(b)) : cg.maxiter
-    threshold = max(float(cg.atol), float(cg.rtol) * norm(b))
-    return _cg_run(operator, b, maxiter, miniter, threshold; x0=x0)
+    # An explicit `threshold` (e.g. an Eisenstat–Walker forcing term from the
+    # Newton-CG outer loop) overrides the static `atol`/`rtol` criterion.
+    thr = threshold === nothing ? max(float(cg.atol), float(cg.rtol) * norm(b)) : threshold
+    return _cg_run(operator, b, maxiter, miniter, thr; x0=x0)
 end

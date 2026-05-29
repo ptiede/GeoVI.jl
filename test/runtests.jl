@@ -11,7 +11,7 @@ using Optimisers
 using Random
 using Statistics: mean
 
-function _linear_gaussian_setup(rng; D=100, M=50, σ²=0.25)
+function _linear_gaussian_setup(rng; D = 100, M = 50, σ² = 0.25)
     A = randn(rng, M, D) ./ sqrt(D)
     ξ_true = randn(rng, D)
     data = A * ξ_true .+ sqrt(σ²) .* randn(rng, M)
@@ -47,7 +47,7 @@ end
     @testset "Gaussian likelihood" begin
         data = [2.0, -1.0]
         precision = [4.0, 9.0]
-        lh = GaussianLikelihood(data; precision=precision)
+        lh = GaussianLikelihood(data; precision = precision)
 
         y = [1.5, -2.0]
         v = [0.3, -0.5]
@@ -67,16 +67,16 @@ end
 
         mat_precision = Diagonal([4.0, 9.0])
         mat_sqrt = Diagonal([2.0, 3.0])
-        mat_lh = GaussianLikelihood(data; precision=mat_precision, sqrt_precision=mat_sqrt)
+        mat_lh = GaussianLikelihood(data; precision = mat_precision, sqrt_precision = mat_sqrt)
         @test fishermetric(mat_lh, y, v) ≈ mat_precision * v
 
-        @test_throws ArgumentError GaussianLikelihood(data; precision=x -> 2 .* x)
+        @test_throws ArgumentError GaussianLikelihood(data; precision = x -> 2 .* x)
     end
 
     @testset "likelihood composition" begin
         data = [1.0, -2.0]
         precision = [3.0, 5.0]
-        base = GaussianLikelihood(data; precision=precision)
+        base = GaussianLikelihood(data; precision = precision)
 
         A = [1.0 2.0; -1.0 0.5]
         forward(x) = A * x
@@ -88,7 +88,7 @@ end
         η = [0.3, 2.0]
         y = forward(x)
 
-        manual = compose(base, forward; pushforward=pushforward, pullback=pullback)
+        manual = compose(base, forward; pushforward = pushforward, pullback = pullback)
 
         @test logdensity(manual, x) ≈ logdensity(base, y)
         @test normalized_residual(manual, x) ≈ normalized_residual(base, y)
@@ -98,11 +98,11 @@ end
         @test fishermetric(manual, x, v) ≈ A' * (precision .* (A * v))
 
         linearize(x) = (
-            value=forward(x),
-            pushforward=v -> A * v,
-            pullback=η -> A' * η,
+            value = forward(x),
+            pushforward = v -> A * v,
+            pullback = η -> A' * η,
         )
-        bundled = compose(base, forward; linearize=linearize)
+        bundled = compose(base, forward; linearize = linearize)
         @test rightsqrtmetric(bundled, x, v) ≈ rightsqrtmetric(base, y, A * v)
         @test leftsqrtmetric(bundled, x, η) ≈ A' * leftsqrtmetric(base, y, η)
         @test fishermetric(bundled, x, v) ≈ A' * (precision .* (A * v))
@@ -113,7 +113,7 @@ end
         end
         GeoVI.pushforward(lin::ToyLinearization, v::AbstractArray) = lin.jacobian * v
         GeoVI.pullback(lin::ToyLinearization, η::AbstractArray) = lin.jacobian' * η
-        method_based = compose(base, forward; linearize=x -> ToyLinearization(forward(x), A))
+        method_based = compose(base, forward; linearize = x -> ToyLinearization(forward(x), A))
         @test rightsqrtmetric(method_based, x, v) ≈ rightsqrtmetric(base, y, A * v)
         @test leftsqrtmetric(method_based, x, η) ≈ A' * leftsqrtmetric(base, y, η)
         @test fishermetric(method_based, x, v) ≈ A' * (precision .* (A * v))
@@ -122,14 +122,14 @@ end
         @test logdensity(automatic, x) ≈ logdensity(base, y)
         @test normalized_residual(automatic, x) ≈ normalized_residual(base, y)
         @test transformation(automatic, x) ≈ transformation(base, y)
-        @test rightsqrtmetric(automatic, x, v) ≈ rightsqrtmetric(base, y, A * v) atol = 1e-6 rtol = 1e-6
-        @test leftsqrtmetric(automatic, x, η) ≈ A' * leftsqrtmetric(base, y, η) atol = 1e-6 rtol = 1e-6
-        @test fishermetric(automatic, x, v) ≈ A' * (precision .* (A * v)) atol = 1e-5 rtol = 1e-5
+        @test rightsqrtmetric(automatic, x, v) ≈ rightsqrtmetric(base, y, A * v) atol = 1.0e-6 rtol = 1.0e-6
+        @test leftsqrtmetric(automatic, x, η) ≈ A' * leftsqrtmetric(base, y, η) atol = 1.0e-6 rtol = 1.0e-6
+        @test fishermetric(automatic, x, v) ≈ A' * (precision .* (A * v)) atol = 1.0e-5 rtol = 1.0e-5
 
-        noauto = compose(base, forward; adtype=GeoVI.ADTypes.NoAutoDiff())
+        noauto = compose(base, forward; adtype = GeoVI.ADTypes.NoAutoDiff())
         @test_throws ArgumentError rightsqrtmetric(noauto, x, v)
         @test_throws ArgumentError leftsqrtmetric(noauto, x, η)
-        @test_throws ArgumentError compose(base, forward; linearize=linearize, pushforward=pushforward)
+        @test_throws ArgumentError compose(base, forward; linearize = linearize, pushforward = pushforward)
     end
 
     @testset "linearization interface" begin
@@ -141,15 +141,15 @@ end
 
         finite_diff = GeoVI._automatic_linearize(GeoVI.ADTypes.AutoFiniteDiff(), forward, x)
         @test finite_diff.value ≈ forward(x)
-        @test GeoVI.pushforward(finite_diff, v) ≈ A * v atol = 1e-6 rtol = 1e-6
-        @test GeoVI.pullback(finite_diff, η) ≈ A' * η atol = 1e-6 rtol = 1e-6
+        @test GeoVI.pushforward(finite_diff, v) ≈ A * v atol = 1.0e-6 rtol = 1.0e-6
+        @test GeoVI.pullback(finite_diff, η) ≈ A' * η atol = 1.0e-6 rtol = 1.0e-6
     end
 
     @testset "exponential-family likelihoods" begin
         v = [0.3, -0.5]
-        eps = 1e-6
+        eps = 1.0e-6
 
-        poisson = PoissonLikelihood([2.0, 4.0]; weight=[1.5, 0.5])
+        poisson = PoissonLikelihood([2.0, 4.0]; weight = [1.5, 0.5])
         ηp = log.([3.0, 5.0])
         λ = exp.(ηp)
         @test logdensity(poisson, ηp) ≈ -sum([1.5, 0.5] .* (λ .- [2.0, 4.0] .* ηp))
@@ -159,25 +159,25 @@ end
         @test fishermetric(poisson, ηp, v) ≈ ([1.5, 0.5] .* λ) .* v
         @test (
             transformation(poisson, ηp .+ eps .* v) .- transformation(poisson, ηp .- eps .* v)
-        ) ./ (2 * eps) ≈ rightsqrtmetric(poisson, ηp, v) atol = 1e-6 rtol = 1e-6
+        ) ./ (2 * eps) ≈ rightsqrtmetric(poisson, ηp, v) atol = 1.0e-6 rtol = 1.0e-6
         @test -leftsqrtmetric(poisson, ηp, normalized_residual(poisson, ηp)) ≈
             [1.5, 0.5] .* (λ .- [2.0, 4.0])
 
-        bernoulli = BernoulliLikelihood([1.0, 0.0]; weight=[2.0, 0.75])
+        bernoulli = BernoulliLikelihood([1.0, 0.0]; weight = [2.0, 0.75])
         ηb = [0.3, -0.4]
-        p = 1 ./(1 .+ exp.(-ηb))
+        p = 1 ./ (1 .+ exp.(-ηb))
         @test logdensity(bernoulli, ηb) ≈
             -sum([2.0, 0.75] .* (log1p.(exp.(ηb)) .- [1.0, 0.0] .* ηb))
         @test fishermetric(bernoulli, ηb, v) ≈ ([2.0, 0.75] .* p .* (1 .- p)) .* v
         @test (
             transformation(bernoulli, ηb .+ eps .* v) .- transformation(bernoulli, ηb .- eps .* v)
-        ) ./ (2 * eps) ≈ rightsqrtmetric(bernoulli, ηb, v) atol = 1e-6 rtol = 1e-6
+        ) ./ (2 * eps) ≈ rightsqrtmetric(bernoulli, ηb, v) atol = 1.0e-6 rtol = 1.0e-6
         @test -leftsqrtmetric(bernoulli, ηb, normalized_residual(bernoulli, ηb)) ≈
             [2.0, 0.75] .* (p .- [1.0, 0.0])
 
-        binomial = BinomialLikelihood([3.0, 1.0]; trials=[5.0, 2.0], weight=[1.0, 0.5])
+        binomial = BinomialLikelihood([3.0, 1.0]; trials = [5.0, 2.0], weight = [1.0, 0.5])
         ηn = [0.2, -0.1]
-        q = 1 ./(1 .+ exp.(-ηn))
+        q = 1 ./ (1 .+ exp.(-ηn))
         μ = [5.0, 2.0] .* q
         @test logdensity(binomial, ηn) ≈
             -sum([1.0, 0.5] .* ([5.0, 2.0] .* log1p.(exp.(ηn)) .- [3.0, 1.0] .* ηn))
@@ -185,18 +185,18 @@ end
             ([1.0, 0.5] .* [5.0, 2.0] .* q .* (1 .- q)) .* v
         @test (
             transformation(binomial, ηn .+ eps .* v) .- transformation(binomial, ηn .- eps .* v)
-        ) ./ (2 * eps) ≈ rightsqrtmetric(binomial, ηn, v) atol = 1e-6 rtol = 1e-6
+        ) ./ (2 * eps) ≈ rightsqrtmetric(binomial, ηn, v) atol = 1.0e-6 rtol = 1.0e-6
         @test -leftsqrtmetric(binomial, ηn, normalized_residual(binomial, ηn)) ≈
             [1.0, 0.5] .* (μ .- [3.0, 1.0])
 
         @test_throws ArgumentError BernoulliLikelihood([0.0, 0.5])
-        @test_throws ArgumentError BinomialLikelihood([2.0]; trials=[1.0])
+        @test_throws ArgumentError BinomialLikelihood([2.0]; trials = [1.0])
     end
 
     @testset "samples" begin
         position = [10.0, 20.0]
         residuals = [1.0 2.0; 3.0 4.0]
-        samples = Samples(position, residuals; keys=[:a, :b])
+        samples = Samples(position, residuals; keys = [:a, :b])
 
         @test length(samples) == 2
         @test posterior_samples(samples) ≈ [11.0 22.0; 13.0 24.0]
@@ -211,82 +211,72 @@ end
     end
 
     @testset "VI surface" begin
-        cfg = VIConfig(n_iterations=4, n_samples=6, mirrored=true)
-        @test cfg.adtype isa GeoVI.ADTypes.AutoFiniteDiff
-        @test cfg.n_iterations == 4
-        @test cfg.n_samples == 6
-        @test cfg.draw_linear == (;)
-        @test cfg.optimizer_options == (;)
-        @test GeoVI._infer_adtype(cfg.adtype, [1.0, 2.0]) isa GeoVI.ADTypes.AutoFiniteDiff
-        @test GeoVI._value_and_gradient(cfg.adtype, x -> sum(abs2, x), [1.0, 2.0])[2] ≈ [2.0, 4.0] atol = 1e-5
+        est = MCEstimator(n_samples = 6, mirrored = true)
+        @test est.n_samples == 6
+        @test est.mirrored
+        @test GeoVI._n_base_draws(est) == 3
+        @test_throws ArgumentError MCEstimator(n_samples = 3, mirrored = true)
+        @test GeoVI._n_base_draws(MCEstimator(n_samples = 5, mirrored = false)) == 5
 
-        cfg_alias = VIConfig(optimizer_options=(; maxiter=10), n_samples=4, adtype=nothing)
-        @test cfg_alias.adtype isa GeoVI.ADTypes.AutoFiniteDiff
-        @test cfg_alias.optimizer_options == (; maxiter=10)
+        @test GeoVI._infer_adtype(GeoVI.ADTypes.AutoFiniteDiff(), [1.0, 2.0]) isa
+            GeoVI.ADTypes.AutoFiniteDiff
+        @test GeoVI._value_and_gradient(
+            GeoVI.ADTypes.AutoFiniteDiff(), x -> sum(abs2, x), [1.0, 2.0]
+        )[2] ≈ [2.0, 4.0] atol = 1.0e-5
 
-        state = initialize_vi(:rng; config=cfg)
-        @test state.iteration == 0
-        @test state.rng == :rng
-        @test state.sample_state === nothing
+        @test NewtonCG(maxiter = 7, cg_rtol = 1.0e-9).maxiter == 7
+        @test NewtonCG(cg_rtol = 1.0e-9).cg.rtol == 1.0e-9
+        @test_throws ArgumentError NewtonCG(maxiter = -1)
 
-        @test_throws ArgumentError VIConfig(n_iterations=1, n_samples=3, mirrored=true)
-
-        simple_lh = GaussianLikelihood([0.0]; precision=[1.0])
+        simple_lh = GaussianLikelihood([0.0]; precision = [1.0])
         problem = VariationalProblem(
             simple_lh,
             [0.0];
-            family=MGVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=NewtonCG(),
-            config=cfg,
+            family = MGVIFamily(),
+            divergence = ReverseKL(),
+            estimator = est,
+            optimizer = NewtonCG(),
         )
         @test problem.adtype isa GeoVI.ADTypes.AutoFiniteDiff
-        @test problem.n_base_draws == 3
-        @test problem.optimizer_options.maxiter == 20
-        problem_state = initialize_vi(problem, MersenneTwister(2))
-        @test problem_state.iteration == 0
-        @test problem_state.rng isa MersenneTwister
+        @test GeoVI._n_base_draws(problem) == 3
+        @test problem.optimizer.maxiter == 20
+
+        rng, state = init(MersenneTwister(2), problem)
+        @test state isa VIState
+        @test rng isa MersenneTwister
+        @test state.iteration == 0
+        @test size(state.residuals) == (6, 1)
 
         @test_throws ArgumentError update_nonlinear_residual(simple_lh, [0.0], [0.0])
-        @test_throws ArgumentError fit(
+        @test_throws ArgumentError VariationalProblem(
+            simple_lh, [0.0]; divergence = ForwardKL(), optimizer = NewtonCG()
+        )
+        @test_throws ArgumentError VariationalProblem(
+            simple_lh, [0.0]; divergence = ReverseKL(), optimizer = :adam
+        )
+
+        nd_problem = VariationalProblem(
             simple_lh,
             [0.0];
-            family=GeoVIFamily(),
-            divergence=ForwardKL(),
-            optimizer=NewtonCG(),
-            config=VIConfig(n_iterations=1),
-            rng=MersenneTwister(1),
+            family = GeoVIFamily(),
+            divergence = ReverseKL(),
+            estimator = MCEstimator(n_samples = 2),
+            optimizer = NewtonCG(),
+            adtype = GeoVI.ADTypes.NoAutoDiff(),
         )
-        @test_throws ArgumentError fit(
-            simple_lh,
-            [0.0];
-            family=GeoVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=:adam,
-            config=VIConfig(n_iterations=1),
-            rng=MersenneTwister(1),
-        )
-        @test_throws ArgumentError fit(
-            simple_lh,
-            [0.0];
-            family=GeoVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=NewtonCG(),
-            config=VIConfig(n_iterations=1, adtype=GeoVI.ADTypes.NoAutoDiff()),
-            rng=MersenneTwister(1),
-        )
+        @test_throws ArgumentError fit(nd_problem, 1; rng = MersenneTwister(1))
     end
 
     @testset "MGVI linear residuals" begin
         precision = [3.0, 5.0]
-        base = GaussianLikelihood([0.0, 0.0]; precision=precision)
+        base = GaussianLikelihood([0.0, 0.0]; precision = precision)
 
         A = [1.0 2.0; -1.0 0.5]
         forward(x) = A * x
         pushforward(x, v) = A * v
         pullback(x, η) = A' * η
 
-        lh = compose(base, forward; pushforward=pushforward, pullback=pullback)
+        lh = compose(base, forward; pushforward = pushforward, pullback = pullback)
         xi = [0.2, -0.1]
 
         posterior_metric = I + A' * Diagonal(precision) * A
@@ -299,26 +289,26 @@ end
             lh,
             xi,
             rng_residual;
-            cg_rtol=1e-12,
-            cg_maxiter=10,
+            cg_rtol = 1.0e-12,
+            cg_maxiter = 10,
         )
         @test residual_draw.info.converged
         @test residual_draw.info.iterations > 0
-        @test residual_draw.residual ≈ posterior_metric \ metric_draw.metric atol = 1e-10 rtol = 1e-10
+        @test residual_draw.residual ≈ posterior_metric \ metric_draw.metric atol = 1.0e-10 rtol = 1.0e-10
 
         @test_throws ErrorException draw_linear_residual(
             lh,
             xi,
             MersenneTwister(11);
-            cg_maxiter=0,
+            cg_maxiter = 0,
         )
 
         stalled_draw = draw_linear_residual(
             lh,
             xi,
             MersenneTwister(11);
-            cg_maxiter=0,
-            throw_on_failure=false,
+            cg_maxiter = 0,
+            throw_on_failure = false,
         )
         @test !stalled_draw.info.converged
         @test stalled_draw.info.iterations == 0
@@ -328,12 +318,12 @@ end
         draws = Matrix{eltype(xi)}(undef, 2, n_draws)
         rng = MersenneTwister(23)
         for i in 1:n_draws
-            draw = draw_linear_residual(lh, xi, rng; cg_rtol=1e-10, cg_maxiter=10)
+            draw = draw_linear_residual(lh, xi, rng; cg_rtol = 1.0e-10, cg_maxiter = 10)
             @test draw.info.converged
             draws[:, i] = draw.residual
         end
 
-        mean_draw = vec(sum(draws; dims=2) ./ n_draws)
+        mean_draw = vec(sum(draws; dims = 2) ./ n_draws)
         centered = draws .- reshape(mean_draw, :, 1)
         empirical_cov = centered * centered' / (n_draws - 1)
         analytic_cov = inv(Matrix(posterior_metric))
@@ -344,14 +334,14 @@ end
 
     @testset "geoVI nonlinear residuals" begin
         precision = [3.0, 5.0]
-        base = GaussianLikelihood([0.0, 0.0]; precision=precision)
+        base = GaussianLikelihood([0.0, 0.0]; precision = precision)
 
         A = [1.0 2.0; -1.0 0.5]
         forward(x) = A * x
         pushforward(x, v) = A * v
         pullback(x, η) = A' * η
 
-        lh = compose(base, forward; pushforward=pushforward, pullback=pullback)
+        lh = compose(base, forward; pushforward = pushforward, pullback = pullback)
         xi = [0.2, -0.1]
 
         rng = MersenneTwister(11)
@@ -360,8 +350,8 @@ end
             lh,
             xi,
             metric_sample;
-            cg_rtol=1e-12,
-            cg_maxiter=10,
+            cg_rtol = 1.0e-12,
+            cg_maxiter = 10,
         )
 
         @test linear_draw.info.converged
@@ -370,29 +360,29 @@ end
             lh,
             xi,
             linear_draw;
-            optimizer_options=(; xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10),
+            optimizer_options = (; xtol = 1.0e-10, cg_rtol = 1.0e-12, cg_maxiter = 10),
         )
 
         @test update.result.converged
-        @test update.residual ≈ linear_draw.residual atol = 1e-12 rtol = 1e-12
-        @test norm(update.result.gradient) < 1e-12
-        @test update.result.value < 1e-24
+        @test update.residual ≈ linear_draw.residual atol = 1.0e-12 rtol = 1.0e-12
+        @test norm(update.result.gradient) < 1.0e-12
+        @test update.result.value < 1.0e-24
 
         mirrored_draw = draw_residual(
             lh,
             xi,
             MersenneTwister(11);
-            draw_linear_kwargs=(; cg_rtol=1e-12, cg_maxiter=10),
-            optimizer_options=(; xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10),
+            draw_linear_kwargs = (; cg_rtol = 1.0e-12, cg_maxiter = 10),
+            optimizer_options = (; xtol = 1.0e-10, cg_rtol = 1.0e-12, cg_maxiter = 10),
         )
 
         @test size(mirrored_draw.residuals) == (2, length(xi))
         @test mirrored_draw.linear.info.converged
         @test mirrored_draw.positive.result.converged
         @test mirrored_draw.negative.result.converged
-        @test mirrored_draw.residuals[1, :] ≈ linear_draw.residual atol = 1e-12 rtol = 1e-12
-        @test mirrored_draw.residuals[2, :] ≈ -linear_draw.residual atol = 1e-12 rtol = 1e-12
-        @test norm(mirrored_draw.residuals[1, :] + mirrored_draw.residuals[2, :]) < 1e-12
+        @test mirrored_draw.residuals[1, :] ≈ linear_draw.residual atol = 1.0e-12 rtol = 1.0e-12
+        @test mirrored_draw.residuals[2, :] ≈ -linear_draw.residual atol = 1.0e-12 rtol = 1.0e-12
+        @test norm(mirrored_draw.residuals[1, :] + mirrored_draw.residuals[2, :]) < 1.0e-12
 
         adam_initial_residual = linear_draw.residual .+ [0.25, -0.2]
         trafo_at_point = transformation(lh, xi)
@@ -407,18 +397,18 @@ end
             lh,
             xi,
             adam_initial_residual;
-            metric_sample=metric_sample,
-            optimizer=Optimisers.Adam(0.05),
-            optimizer_options=(; maxiter=400, miniter=50, xtol=1e-10, absdelta=1e-12),
+            metric_sample = metric_sample,
+            optimizer = Optimisers.Adam(0.05),
+            optimizer_options = (; maxiter = 400, miniter = 50, xtol = 1.0e-10, absdelta = 1.0e-12),
         )
 
         @test adam_update.result.converged
         @test adam_update.result.optimizer_state !== nothing
         @test adam_update.result.value < adam_initial_value
         @test norm(adam_update.result.gradient) < norm(adam_initial_gradient)
-        @test adam_update.residual ≈ linear_draw.residual atol = 1e-3 rtol = 1e-3
+        @test adam_update.residual ≈ linear_draw.residual atol = 1.0e-3 rtol = 1.0e-3
 
-        toy_base = GaussianLikelihood([0.0]; precision=[4.0])
+        toy_base = GaussianLikelihood([0.0]; precision = [4.0])
         toy_forward(x) = x .+ 0.25 .* x .^ 3
         toy_jac(x) = 1 .+ 0.75 .* x .^ 2
         toy_pushforward(x, v) = toy_jac(x) .* v
@@ -427,8 +417,8 @@ end
         toy_lh = compose(
             toy_base,
             toy_forward;
-            pushforward=toy_pushforward,
-            pullback=toy_pullback,
+            pushforward = toy_pushforward,
+            pullback = toy_pullback,
         )
         toy_xi = [0.35]
 
@@ -438,8 +428,8 @@ end
             toy_lh,
             toy_xi,
             toy_metric_sample;
-            cg_rtol=1e-12,
-            cg_maxiter=20,
+            cg_rtol = 1.0e-12,
+            cg_maxiter = 20,
         )
 
         @test toy_linear_draw.info.converged
@@ -457,19 +447,19 @@ end
             toy_lh,
             toy_xi,
             toy_linear_draw;
-            optimizer_options=(; maxiter=20, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=20),
+            optimizer_options = (; maxiter = 20, xtol = 1.0e-10, cg_rtol = 1.0e-12, cg_maxiter = 20),
         )
 
         @test toy_update.result.converged
         @test toy_update.result.value < initial_value
         @test norm(toy_update.result.gradient) < norm(initial_gradient)
-        @test abs(toy_update.residual[1] - toy_linear_draw.residual[1]) > 1e-4
+        @test abs(toy_update.residual[1] - toy_linear_draw.residual[1]) > 1.0e-4
 
         skipped_update = update_nonlinear_residual(
             toy_lh,
             toy_xi,
             toy_linear_draw;
-            optimizer_options=(; maxiter=0),
+            optimizer_options = (; maxiter = 0),
         )
 
         @test skipped_update.residual == toy_linear_draw.residual
@@ -478,192 +468,159 @@ end
     end
 
     @testset "outer VI loop" begin
-        lh = GaussianLikelihood([2.0]; precision=[4.0])
+        lh = GaussianLikelihood([2.0]; precision = [4.0])
         xi0 = [0.0]
         analytic_mean = [1.6]
 
-        mgvi_cfg = VIConfig(
-            n_iterations=3,
-            n_samples=8,
-            mirrored=true,
-            draw_linear=(; cg_rtol=1e-12, cg_maxiter=10),
-            optimizer_options=(; maxiter=12, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10, fd_eps=1e-6),
-        )
+        mgvi_family = MGVIFamily(solver = ConjugateGradient(rtol = 1.0e-12, maxiter = 10))
+        outer = NewtonCG(maxiter = 12, xtol = 1.0e-10, cg_rtol = 1.0e-12, cg_maxiter = 10)
+        est = MCEstimator(n_samples = 8, mirrored = true)
 
         mgvi_problem = VariationalProblem(
             lh,
             xi0;
-            family=MGVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=NewtonCG(),
-            config=mgvi_cfg,
+            family = mgvi_family,
+            divergence = ReverseKL(),
+            estimator = est,
+            optimizer = outer,
         )
-        step_state = initialize_vi(mgvi_problem, MersenneTwister(5))
-        step_samples, step_state = step_vi(mgvi_problem, xi0, step_state)
+
+        # in-place step_vi! mutates one VIState
+        rng_step, step_state = init(MersenneTwister(5), mgvi_problem)
+        step_vi!(rng_step, mgvi_problem, step_state)
         @test step_state.iteration == 1
-        @test step_state.sample_state.family isa MGVIFamily
-        @test step_state.minimization_state.converged
-        @test length(step_samples) == 8
-        @test length(step_samples.keys) == 4
+        @test size(step_state.residuals, 1) == 8
+        @test length(posterior(mgvi_problem, step_state).samples.keys) == 4
 
-        mgvi_problem_samples, mgvi_problem_state = fit(mgvi_problem; rng=MersenneTwister(5))
-        @test mgvi_problem_state.iteration == mgvi_cfg.n_iterations
-        @test mgvi_problem_samples.position ≈ analytic_mean atol = 0.2 rtol = 0.0
+        # fit returns a VariationalPosterior
+        mgvi_post = fit(mgvi_problem, 3; rng = MersenneTwister(5))
+        @test mgvi_post isa VariationalPosterior
+        @test mean(mgvi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
+        @test length(mgvi_post.samples) == 8
+        @test size(posterior_samples(mgvi_post.samples)) == (8, 1)
 
-        mgvi_samples, mgvi_state = fit(
-            lh,
-            xi0,
-            MGVIFamily(),
-            ReverseKL(),
-            NewtonCG();
-            config=mgvi_cfg,
-            rng=MersenneTwister(5),
+        # the explicit loop reuses one VIState and matches fit bit-for-bit
+        rng, state = init(MersenneTwister(5), mgvi_problem)
+        for _ in 1:3
+            step_vi!(rng, mgvi_problem, state)
+        end
+        @test state.iteration == 3
+        @test mean(posterior(mgvi_problem, state)) ≈ mean(mgvi_post) atol = 1.0e-12 rtol = 1.0e-12
+
+        # rand draws arbitrary new samples from the fitted distribution
+        draws = rand(MersenneTwister(7), mgvi_post, 64)
+        @test size(draws) == (64, 1)
+
+        # geoVI: linear draw + nonlinear curve
+        geovi_family = GeoVIFamily(
+            solver = ConjugateGradient(rtol = 1.0e-12, maxiter = 10),
+            curve = NewtonCG(maxiter = 4, xtol = 1.0e-10, cg_rtol = 1.0e-12, cg_maxiter = 10),
         )
-        @test mgvi_state.iteration == mgvi_cfg.n_iterations
-        @test mgvi_state.sample_state.family isa MGVIFamily
-        @test mgvi_state.minimization_state.converged
-        @test length(mgvi_samples) == mgvi_cfg.n_samples
-        @test size(posterior_samples(mgvi_samples)) == (mgvi_cfg.n_samples, 1)
-        @test mgvi_samples.position ≈ analytic_mean atol = 0.2 rtol = 0.0
-
-        geovi_cfg = VIConfig(
-            n_iterations=3,
-            n_samples=8,
-            mirrored=true,
-            draw_linear=(; cg_rtol=1e-12, cg_maxiter=10),
-            nonlinear_update=(; maxiter=4, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10),
-            optimizer_options=(; maxiter=12, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10, fd_eps=1e-6),
-        )
-
-        geovi_samples, geovi_state = fit(
+        geovi_problem = VariationalProblem(
             lh,
             xi0;
-            family=GeoVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=NewtonCG(),
-            config=geovi_cfg,
-            rng=MersenneTwister(5),
+            family = geovi_family,
+            divergence = ReverseKL(),
+            estimator = est,
+            optimizer = outer,
         )
-        @test geovi_state.iteration == geovi_cfg.n_iterations
-        @test geovi_state.sample_state.family isa GeoVIFamily
-        @test geovi_state.minimization_state.converged
-        @test length(geovi_samples) == geovi_cfg.n_samples
-        @test geovi_samples.position ≈ analytic_mean atol = 0.2 rtol = 0.0
+        rng_g, geovi_state = init(MersenneTwister(5), geovi_problem)
+        step_vi!(rng_g, geovi_problem, geovi_state)
+        @test geovi_problem.family isa GeoVIFamily
+        geovi_post = fit(geovi_problem, 3; rng = MersenneTwister(5))
+        @test mean(geovi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
 
-        alias_samples, alias_state = fit(
-            lh,
-            xi0;
-            family=MGVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=NewtonCG(),
-            config=mgvi_cfg,
-            rng=MersenneTwister(5),
-        )
-        @test alias_state.iteration == mgvi_cfg.n_iterations
-        @test alias_samples.position ≈ mgvi_samples.position atol = 1e-12 rtol = 1e-12
-
-        kw_samples, kw_state = fit(
-            MersenneTwister(9),
-            lh,
-            xi0;
-            family=MGVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=NewtonCG(),
-            config=VIConfig(
-                n_iterations=1,
-                n_samples=4,
-                mirrored=true,
-                draw_linear=(; cg_rtol=1e-12, cg_maxiter=10),
-                optimizer_options=(; maxiter=8, xtol=1e-10, cg_rtol=1e-12, cg_maxiter=10, fd_eps=1e-6),
-            ),
-        )
-        @test kw_state.iteration == 1
-        @test length(kw_samples) == 4
-
-        adam = Optimisers.Adam(0.05)
-        adam_cfg = VIConfig(
-            n_iterations=1,
-            n_samples=0,
-            mirrored=true,
-            optimizer_options=(; maxiter=400, miniter=50, xtol=1e-10, absdelta=1e-12, fd_eps=1e-6),
-        )
-        adam_samples, adam_state = fit(
-            lh,
-            xi0,
-            MGVIFamily(),
-            ReverseKL(),
-            adam;
-            config=adam_cfg,
-            rng=MersenneTwister(11),
-        )
-        @test adam_state.iteration == 1
-        @test adam_state.minimization_state.converged
-        @test adam_state.minimization_state.optimizer_state !== nothing
-        @test adam_samples.position ≈ analytic_mean atol = 1e-2 rtol = 0.0
-
-        adam_step_cfg = VIConfig(
-            n_iterations=0,
-            n_samples=0,
-            mirrored=true,
-            optimizer_options=(; maxiter=1, xtol=0.0, fd_eps=1e-6),
-        )
+        # A bare Optimisers rule is the outer optimizer: each step_vi! takes one
+        # gradient step, and the user owns the iteration count. With no samples
+        # this optimizes the latent mean (MAP) directly.
         adam_problem = VariationalProblem(
             lh,
             xi0;
-            family=MGVIFamily(),
-            divergence=ReverseKL(),
-            optimizer=adam,
-            config=adam_step_cfg,
+            family = MGVIFamily(),
+            divergence = ReverseKL(),
+            estimator = MCEstimator(n_samples = 0),
+            optimizer = Optimisers.Adam(0.05),
         )
-        adam_step_state0 = initialize_vi(adam_problem, MersenneTwister(12))
-        adam_step1, adam_step_state1 = step_vi(adam_problem, xi0, adam_step_state0)
-        adam_step2, adam_step_state2 = step_vi(adam_problem, adam_step1, adam_step_state1)
-        fresh_second = GeoVI._update_position(
-            adam_problem,
-            Samples(adam_step1.position, nothing; keys=nothing),
-            nothing,
+        adam_post = fit(adam_problem, 400; rng = MersenneTwister(11))
+        @test mean(adam_post) ≈ analytic_mean atol = 1.0e-2 rtol = 0.0
+
+        # Adam optimizer state persists across steps: two steps (carrying
+        # momentum) differ from a fresh single step at the same position.
+        adam_step_problem = VariationalProblem(
+            lh,
+            xi0;
+            family = MGVIFamily(),
+            divergence = ReverseKL(),
+            estimator = MCEstimator(n_samples = 0),
+            optimizer = Optimisers.Adam(0.05),
         )
-        @test adam_step_state1.minimization_state.optimizer_state !== nothing
-        @test adam_step_state2.minimization_state.optimizer_state !== nothing
-        @test abs(adam_step2.position[1] - fresh_second.x[1]) > 1e-8
+        rng_s, s = init(MersenneTwister(12), adam_step_problem)
+        step_vi!(rng_s, adam_step_problem, s)
+        pos1 = copy(s.position)
+        @test s.optimizer_state !== nothing
+        step_vi!(rng_s, adam_step_problem, s)
+        @test s.optimizer_state !== nothing
+        with_momentum = s.position[1]
+        rng_f, sf = init(MersenneTwister(12), adam_step_problem)
+        copyto!(sf.position, pos1)
+        step_vi!(rng_f, adam_step_problem, sf)
+        @test abs(with_momentum - sf.position[1]) > 1.0e-8
+
+        # family × divergence joint dispatch
+        @test GeoVI._fdivergence_value(MGVIFamily(), ReverseKL(), lh, xi0, nothing) ≈
+            GeoVI._negative_logposterior(lh, xi0)
+        @test_throws ArgumentError GeoVI._fdivergence_value(
+            MGVIFamily(), ForwardKL(), lh, xi0, nothing
+        )
     end
 
     @testset "linear-Gaussian conjugate end-to-end" begin
-        rng = MersenneTwister(0xa11ce)
+        rng = MersenneTwister(0x000a11ce)
         D, M = 100, 50
-        setup = _linear_gaussian_setup(rng; D=D, M=M, σ²=0.25)
+        setup = _linear_gaussian_setup(rng; D = D, M = M, σ² = 0.25)
         forward = ξ -> setup.A * ξ
-        lh = compose(GaussianLikelihood(setup.data; precision=setup.precision), forward)
+        lh = compose(GaussianLikelihood(setup.data; precision = setup.precision), forward)
         xi0 = zeros(D)
 
-        cfg = VIConfig(
-            n_iterations=8,
-            n_samples=128,
-            mirrored=true,
-            draw_linear=(; cg_rtol=1e-10, cg_maxiter=200),
-            optimizer_options=(; maxiter=20, xtol=1e-9, cg_rtol=1e-10, cg_maxiter=200, fd_eps=1e-6),
-        )
+        n_samples = 128
+        est = MCEstimator(n_samples = n_samples, mirrored = true)
+        solver = ConjugateGradient(rtol = 1.0e-10, maxiter = 200)
+        outer = NewtonCG(maxiter = 20, xtol = 1.0e-9, cg_rtol = 1.0e-10, cg_maxiter = 200)
 
-        for family in (MGVIFamily(), GeoVIFamily())
-            samples, state = fit(
+        families = (
+            MGVIFamily(solver = solver),
+            GeoVIFamily(solver = solver, curve = NewtonCG(cg_rtol = 1.0e-10, cg_maxiter = 200)),
+        )
+        for family in families
+            problem = VariationalProblem(
                 lh,
                 xi0;
-                family=family,
-                divergence=ReverseKL(),
-                optimizer=NewtonCG(),
-                config=cfg,
-                rng=MersenneTwister(2025),
+                family = family,
+                divergence = ReverseKL(),
+                estimator = est,
+                optimizer = outer,
             )
-            @test state.iteration == cfg.n_iterations
-            @test samples.position ≈ setup.μ_post atol = 0.1 rtol = 0.0
+            post = fit(problem, 8; rng = MersenneTwister(2025))
+            @test mean(post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
 
-            draws = posterior_samples(samples)
-            @test size(draws) == (cfg.n_samples, D)
-            @test vec(mean(draws; dims=1)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
+            draws = posterior_samples(post.samples)
+            @test size(draws) == (n_samples, D)
+            @test vec(mean(draws; dims = 1)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
 
-            centered = draws .- mean(draws; dims=1)
-            tr_emp = sum(abs2, centered) / cfg.n_samples
+            centered = draws .- mean(draws; dims = 1)
+            tr_emp = sum(abs2, centered) / n_samples
             @test tr_emp ≈ tr(setup.Σ_post) rtol = 0.25
+
+            # `rand` from the fitted distribution recovers the posterior moments.
+            # Independent (non-mirrored) draws carry Monte-Carlo noise, so the
+            # sample-mean norm is bounded by the per-dimension MC error rather
+            # than a tight elementwise tolerance.
+            n_rand = 512
+            rdraws = rand(MersenneTwister(99), post, n_rand)
+            mc_err = sqrt(tr(setup.Σ_post) / n_rand)
+            @test norm(vec(mean(rdraws; dims = 1)) .- mean(post)) < 4 * mc_err
+            rcentered = rdraws .- mean(rdraws; dims = 1)
+            @test sum(abs2, rcentered) / n_rand ≈ tr(setup.Σ_post) rtol = 0.3
         end
     end
 
@@ -671,63 +628,54 @@ end
         if !HAS_REACTANT
             @info "Skipping Reactant tests because `Reactant` is not available in the active environment."
         else
-            rng = MersenneTwister(0xb0b)
+            rng = MersenneTwister(0x0b0b)
             D, M = 64, 32
-            setup = _linear_gaussian_setup(rng; D=D, M=M, σ²=0.25)
+            setup = _linear_gaussian_setup(rng; D = D, M = M, σ² = 0.25)
             A_r = Reactant.to_rarray(Float32.(setup.A))
             data_r = Reactant.to_rarray(Float32.(setup.data))
             precision_r = Reactant.to_rarray(Float32.(setup.precision))
             xi0_r = Reactant.to_rarray(zeros(Float32, D))
             forward = ξ -> A_r * ξ
             lh = compose(
-                GaussianLikelihood(data_r; precision=precision_r),
+                GaussianLikelihood(data_r; precision = precision_r),
                 forward;
-                adtype=GeoVI.ADTypes.AutoEnzyme(),
+                adtype = GeoVI.ADTypes.AutoEnzyme(),
             )
 
-            cfg = VIConfig(
-                n_iterations=8,
-                n_samples=128,
-                mirrored=true,
-                adtype=GeoVI.ADTypes.AutoEnzyme(),
-                draw_linear=(; cg_rtol=1.0f-6, cg_maxiter=200),
-                optimizer_options=(; maxiter=20, xtol=1.0f-6, fd_eps=1.0f-4),
-            )
-
+            n_samples = 128
             problem = VariationalProblem(
                 lh,
                 xi0_r;
-                family=MGVIFamily(),
-                divergence=ReverseKL(),
-                optimizer=NewtonCG(),
-                config=cfg,
+                family = MGVIFamily(solver = ConjugateGradient(rtol = 1.0f-6, maxiter = 200)),
+                divergence = ReverseKL(),
+                estimator = MCEstimator(n_samples = n_samples, mirrored = true),
+                optimizer = NewtonCG(maxiter = 20, xtol = 1.0f-6),
+                adtype = GeoVI.ADTypes.AutoEnzyme(),
             )
 
-            samples, state = fit(problem; rng=MersenneTwister(0xfeed))
-            @test state.iteration == cfg.n_iterations
-            @test state.rng isa Reactant.ReactantRNG
-            @test state.cache isa GeoVI.ADTypes.AutoReactant ||
-                  nameof(typeof(state.cache)) == :ReactantVIStepCache
+            rng, state = init(MersenneTwister(0xfeed), problem)
+            @test rng isa Reactant.ReactantRNG
+            for _ in 1:8
+                step_vi!(rng, problem, state)
+            end
+            @test state.iteration == 8
+            @test nameof(typeof(state.cache)) == :ReactantVIStepCache
 
-            position_host = Array(samples.position)
+            post = posterior(problem, state)
+            position_host = Array(mean(post))
             @test position_host ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
 
-            draws_host = Array(posterior_samples(samples))
-            @test size(draws_host) == (cfg.n_samples, D)
-            @test vec(mean(draws_host; dims=1)) ≈ Float32.(setup.μ_post) atol = 0.25 rtol = 0.0
+            draws_host = Array(posterior_samples(post.samples))
+            @test size(draws_host) == (n_samples, D)
+            @test vec(mean(draws_host; dims = 1)) ≈ Float32.(setup.μ_post) atol = 0.25 rtol = 0.0
 
-            centered = draws_host .- mean(draws_host; dims=1)
-            tr_emp = sum(abs2, centered) / cfg.n_samples
+            centered = draws_host .- mean(draws_host; dims = 1)
+            tr_emp = sum(abs2, centered) / n_samples
             @test tr_emp ≈ tr(setup.Σ_post) rtol = 0.35
 
-            bypass_state = GeoVI.VIState(
-                iteration=0,
-                rng=MersenneTwister(0),
-                sample_state=nothing,
-                minimization_state=nothing,
-                cache=nothing,
-            )
-            @test_throws ArgumentError step_vi(problem, xi0_r, bypass_state)
+            # AutoReactant requires a ReactantRNG; a plain RNG must error.
+            _, bypass_state = init(MersenneTwister(0xfeed), problem)
+            @test_throws ArgumentError step_vi!(MersenneTwister(0), problem, bypass_state)
         end
     end
 end
