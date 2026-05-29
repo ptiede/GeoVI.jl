@@ -331,7 +331,7 @@ etc.) in the public API. Those should stay internal helper machinery.
 
 - Dense-array utilities for white latent coordinates
 - `AbstractLikelihood`, `GaussianLikelihood`, and `ComposedLikelihood`
-- `Samples`, `VIConfig`, `VIState`
+- `Samples`, `VariationalProblem` (the four axes), `VIState`
 - a reference finite-difference fallback
 
 ### Phase 2: MGVI core
