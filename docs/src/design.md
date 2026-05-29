@@ -246,9 +246,14 @@ end
 post = posterior(problem, state)  # a VariationalPosterior
 ```
 
-`fit(problem, n; rng)` is a convenience that runs the loop and returns the
-posterior. Under Reactant the in-place step is compiled (Reactant traces the
-mutation directly).
+`step_vi!(rng, problem, state, n_refine=0)` optionally runs `n_refine` extra
+`transform!`→`update!` refinements that reuse the drawn noise (common random
+numbers — recompute the Fisher / re-curve at the moved mean).
+
+`fit(problem, n; rng, n_refine=0)` is a convenience that runs the loop and returns
+the posterior. Under Reactant, `step_vi!` is a pure in-place mutation the user
+`@compile`s themselves and loops; `fit` does this for you (compile `step_vi!`
+once with a `ConcreteRNumber` `n_refine`, then loop the thunk).
 
 ## Example User Flow
 
