@@ -106,22 +106,21 @@ _n_base_draws(problem::VariationalProblem) = _n_base_draws(problem.estimator)
 
 Mutable numeric state for the VI loop: only the evolving quantities, not the
 problem or the RNG (both are passed to [`step_vi!`](@ref) separately). Allocated
-once by [`init`](@ref) with every field at its final type — the iteration
-counter, the current mean (`position`), the residual buffer (`residuals`), the
-stored per-base-draw white noise (`metric_white`, `prior_white`) that
-[`transform!`](@ref GeoVI.transform!) de-whitens (and that custom loops can reuse
-to recompute the transform at a moved mean), the threaded `optimizer_state`, and
-the compilation `cache` — and advanced in place, so reusing one `VIState` keeps
-per-iteration allocation flat.
+once by [`init`](@ref) with every field at its final type — the current mean
+(`position`), the residual buffer (`residuals`), the stored per-base-draw white
+noise (`metric_white`, `prior_white`) that [`transform!`](@ref GeoVI.transform!)
+de-whitens (and that custom loops reuse to recompute the transform at a moved
+mean), and the threaded `optimizer_state` — advanced in place, so reusing one
+`VIState` keeps per-iteration allocation flat. It holds no host-only fields (no
+iteration counter, no compile cache), so [`step_vi!`](@ref) is a pure in-place
+mutation the user can `@compile` directly under Reactant.
 """
-mutable struct VIState{P, R, M, Pw, Os, C}
-    iteration::Int
+mutable struct VIState{P, R, M, Pw, Os}
     position::P
     residuals::R
     metric_white::M
     prior_white::Pw
     optimizer_state::Os
-    cache::C
 end
 
 _wrap_rng(_adtype, rng) = rng
@@ -149,23 +148,15 @@ end
 _init_optimizer_state(problem::VariationalProblem, position) =
     _optimizer_state(problem.optimizer, position, nothing)
 
-# Compilation cache, built once at `init`. Eager backends need none (`nothing`);
-# the Reactant extension overrides this to `@compile` the step for the exact
-# preallocated buffers and return a fully-populated, concretely-typed cache.
-_init_cache(
-    _adtype, problem, position, residuals, metric_white, prior_white, rng, optimizer_state
-) = nothing
-
 """
     init([rng], problem) -> (rng, state)
 
 Allocate the [`VIState`](@ref) for `problem` — a fresh copy of the initial
-position, the residual buffer, the optimizer state, and the compilation cache —
-and return it together with the loop RNG to thread through [`step_vi!`](@ref).
-Everything is built here at its final type: for an `AutoReactant` problem the
-RNG is wrapped into a `Reactant.ReactantRNG` and the step is compiled for the
-preallocated buffers, so the cache holds the concrete compiled step (no
-recompilation on the first iteration). `rng` defaults to `Random.default_rng()`.
+position, the residual buffer, the white-noise buffers, and the optimizer state —
+and return it together with the loop RNG to thread through [`step_vi!`](@ref). For
+an `AutoReactant` problem the RNG is wrapped into a `Reactant.ReactantRNG` (the
+compiled step is built lazily by `fit`, or by the user calling
+`@compile step_vi!(...)`). `rng` defaults to `Random.default_rng()`.
 """
 function init(rng::AbstractRNG, problem::VariationalProblem)
     position = copy(problem.initial_samples.position)
@@ -173,14 +164,8 @@ function init(rng::AbstractRNG, problem::VariationalProblem)
     metric_white, prior_white = _init_white_buffers(problem, position)
     optimizer_state = _init_optimizer_state(problem, position)
     wrapped_rng = _wrap_rng(problem.adtype, rng)
-    cache = _init_cache(
-        problem.adtype, problem, position, residuals, metric_white, prior_white,
-        wrapped_rng, optimizer_state,
-    )
     return wrapped_rng,
-        VIState(
-            0, position, residuals, metric_white, prior_white, optimizer_state, cache,
-        )
+        VIState(position, residuals, metric_white, prior_white, optimizer_state)
 end
 
 init(problem::VariationalProblem; rng::AbstractRNG = Random.default_rng()) =
@@ -650,68 +635,73 @@ end
 # ── Step / fit ─────────────────────────────────────────────────────────────
 
 """
-    _vi_step!(problem, position, residuals, metric_white, prior_white, rng, opt_state)
-        -> OptimizationResult
+    step_vi!(rng, problem, state::VIState, n_refine = 0) -> state
 
-One fresh VI iteration done in place — the three phases inlined: draw white noise
-(phase 1), de-whiten it into `residuals` at the current mean (phase 2), optimize
-the mean and write it back into `position` (phase 3). `rng` is advanced in place.
-This is the unit compiled by the Reactant extension (it traces the in-place
-mutation) and run directly on the eager path. Returns the `OptimizationResult`
-(the caller keeps its `optimizer_state`).
+Advance the VI loop in place, reusing `state` and its buffers: a fresh
+`sample!` → `transform!` → `update!` cycle, then `n_refine` extra
+`transform!` → `update!` refinements that **reuse the drawn noise** — recomputing
+the Fisher / re-curving at the moved mean (common random numbers, the cheap
+geoVI inner loop). `rng` is advanced in place; `problem` is the immutable config.
+
+`step_vi!` is a pure in-place mutation with no host-only state, so under Reactant
+you compile it yourself and call the compiled thunk in your loop:
+
+```julia
+rng, state = init(rng, problem)
+cstep = @compile step_vi!(rng, problem, state, Reactant.ConcreteRNumber(k))
+for _ in 1:n; cstep(rng, problem, state, Reactant.ConcreteRNumber(k)); end
+```
+
+Passing `n_refine` as a `ConcreteRNumber{Int}` keeps it a *runtime* loop bound, so
+one compiled graph serves any count (and the whole cycle fuses). [`fit`](@ref)
+does this for you. For finer control, compose the phase primitives
+`GeoVI.sample!` / `GeoVI.transform!` / `GeoVI.update!` directly.
 """
-function _vi_step!(
-        problem::VariationalProblem, position, residuals, metric_white, prior_white,
-        rng, opt_state,
-    )
-    _draw_white_noise!(metric_white, prior_white, rng)
-    _transform!(problem, position, residuals, metric_white, prior_white)
-    result = _optimize_position(problem, position, residuals, opt_state)
-    copyto!(position, result.x)
-    return result
-end
-
-function _step_vi!(::Any, rng, problem::VariationalProblem, state::VIState)
-    result = _vi_step!(
-        problem, state.position, state.residuals, state.metric_white, state.prior_white,
-        rng, state.optimizer_state,
-    )
-    state.optimizer_state = result.optimizer_state
-    state.iteration += 1
-    return state
-end
-
-"""
-    step_vi!(rng, problem, state::VIState) -> state
-
-Advance the VI loop one iteration in place, reusing `state` and its buffers: a
-fresh `sample!` → `transform!` → `update!` cycle. `rng` is advanced in place;
-`problem` is the immutable configuration. For custom schedules — e.g. drawing
-once then refining the mean against a fixed realization — compose the phase
-primitives `GeoVI.sample!` / `GeoVI.transform!` / `GeoVI.update!` directly.
-"""
-function step_vi!(rng, problem::VariationalProblem, state::VIState)
-    _step_vi!(problem.adtype, rng, problem, state)
-    return state
-end
-
-"""
-    fit([rng], problem, n_iterations) -> VariationalPosterior
-
-Convenience driver: run `n_iterations` of [`step_vi!`](@ref) and return the fitted
-[`VariationalPosterior`](@ref). `rng` defaults to `Random.default_rng()`.
-"""
-function fit(rng::AbstractRNG, problem::VariationalProblem, n_iterations::Integer)
-    n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))
-    rng, state = init(rng, problem)
-    for _ in 1:n_iterations
-        step_vi!(rng, problem, state)
+function step_vi!(rng, problem::VariationalProblem, state::VIState, n_refine = 0)
+    sample!(rng, problem, state)
+    transform!(problem, state)
+    update!(problem, state)
+    # `n_refine` extra refinements reusing the drawn noise. `@trace for` with a
+    # `ConcreteRNumber` bound is a runtime loop (recompile-free); eager / `Int`
+    # bound it is a plain loop (empty when `n_refine == 0`).
+    @trace track_numbers = false for _ in 1:n_refine
+        transform!(problem, state)
+        update!(problem, state)
     end
+    return state
+end
+
+# Drive `n_iterations` of `step_vi!`. The eager path loops directly; the Reactant
+# extension overrides this to `@compile step_vi!` once (wrapping `n_refine` as a
+# `ConcreteRNumber`) and loop the compiled thunk.
+function _run_vi!(::Any, rng, problem::VariationalProblem, state::VIState, n_iterations, n_refine)
+    for _ in 1:n_iterations
+        step_vi!(rng, problem, state, n_refine)
+    end
+    return state
+end
+
+"""
+    fit([rng], problem, n_iterations; n_refine = 0) -> VariationalPosterior
+
+Convenience driver: run `n_iterations` of [`step_vi!`](@ref) (each with `n_refine`
+noise-reusing refinements) and return the fitted [`VariationalPosterior`](@ref).
+Under Reactant it compiles `step_vi!` once and loops the compiled thunk. `rng`
+defaults to `Random.default_rng()`.
+"""
+function fit(
+        rng::AbstractRNG, problem::VariationalProblem, n_iterations::Integer;
+        n_refine::Integer = 0,
+    )
+    n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))
+    n_refine >= 0 || throw(ArgumentError("`n_refine` must be non-negative"))
+    rng, state = init(rng, problem)
+    _run_vi!(problem.adtype, rng, problem, state, n_iterations, n_refine)
     return posterior(problem, state)
 end
 
-fit(problem::VariationalProblem, n_iterations::Integer; rng::AbstractRNG = Random.default_rng()) =
-    fit(rng, problem, n_iterations)
+fit(problem::VariationalProblem, n_iterations::Integer; rng::AbstractRNG = Random.default_rng(), n_refine::Integer = 0) =
+    fit(rng, problem, n_iterations; n_refine = n_refine)
 
 """
     posterior(problem, state::VIState) -> VariationalPosterior

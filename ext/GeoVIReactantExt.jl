@@ -13,15 +13,9 @@ const _ReactantArray = Union{Reactant.ConcreteRArray, Reactant.TracedRArray}
 
 # Note: the family/optimizer/estimator/ConjugateGradient config structs need no
 # `make_tracer`/`traced_type_inner` pass-through hooks. They flow into the
-# compiled `_vi_step!` as arguments, but Reactant treats their plain
+# compiled `step_vi!` as arguments, but Reactant treats their plain
 # Int/Float64/Bool fields as compile-time constants, and the hot loops use
 # `@trace ... track_numbers=false` so the deep number-walk is suppressed there.
-
-# Holds the compiled `_vi_step!`, built once at `init` (see `_init_cache`) for the
-# exact preallocated buffers — one concrete thunk, no `Any`, no recompilation.
-struct ReactantVIStepCache{F}
-    step::F
-end
 
 struct ReactantOptimizerState{R, S}
     rule::R
@@ -176,50 +170,28 @@ end
 GeoVI._tangent_template(::ADTypes.AutoReactant, lh::GeoVI.AbstractLikelihood, xi) =
     @jit(GeoVI._metric_tangent_template(lh, xi))
 
-function GeoVI._init_cache(
-        ::ADTypes.AutoReactant, problem::GeoVI.VariationalProblem,
-        position, residuals, metric_white, prior_white, rng, optimizer_state,
+# Drive the loop under Reactant: compile `step_vi!` ONCE for the preallocated
+# buffers (with `n_refine` as a `ConcreteRNumber` so its inner refinement loop is
+# a runtime bound — one compile serves any count), then call the compiled thunk
+# `n_iterations` times. `step_vi!` mutates the state's arrays in place, so the
+# loop just re-invokes it. Users wanting a custom loop call `@compile step_vi!`
+# themselves (the same primitive).
+function GeoVI._run_vi!(
+        ::ADTypes.AutoReactant, rng, problem::GeoVI.VariationalProblem, state::GeoVI.VIState,
+        n_iterations, n_refine,
     )
-    rng isa Reactant.ReactantRNG || throw(
-        ArgumentError(
-            "AutoReactant requires a `Reactant.ReactantRNG`; got $(typeof(rng)). " *
-                "Pass an `AbstractRNG` to `init` (which auto-wraps it) or construct " *
-                "`Reactant.ReactantRNG()` directly.",
-        )
-    )
+    # `init` always wraps the rng into a `Reactant.ReactantRNG` for an AutoReactant
+    # problem, so by here `rng` is device-side and its draws advance per compiled
+    # call. (A host rng would be baked in as a compile-time constant — frozen noise.)
+    nref = Reactant.ConcreteRNumber(Int(n_refine))
     @info "GeoVI: compiling step_vi!..."
     t_compile = @elapsed begin
-        step = @compile GeoVI._vi_step!(
-            problem, position, residuals, metric_white, prior_white, rng, optimizer_state
-        )
+        cstep = @compile GeoVI.step_vi!(rng, problem, state, nref)
     end
-    @info "GeoVI: compilation done" t_compile
-    return ReactantVIStepCache(step)
-end
-
-function GeoVI._step_vi!(
-        ::ADTypes.AutoReactant, rng, problem::GeoVI.VariationalProblem, state::GeoVI.VIState,
-    )
-    rng isa Reactant.ReactantRNG || throw(
-        ArgumentError(
-            "AutoReactant requires the `Reactant.ReactantRNG` returned by `init`; " *
-                "got $(typeof(rng)).",
-        )
-    )
-    # The compiled step (built at `init` for these exact buffers) runs the three
-    # phases, mutating position/residuals/white-noise/rng in place and returning
-    # the OptimizationResult; we keep its threaded optimizer state.
-    @debug "GeoVI: running compiled step..."
-    t_run = @elapsed begin
-        result = state.cache.step(
-            problem, state.position, state.residuals, state.metric_white,
-            state.prior_white, rng, state.optimizer_state,
-        )
+    @info "GeoVI: compilation done in" t_compile
+    for _ in 1:n_iterations
+        cstep(rng, problem, state, nref)
     end
-    @debug "GeoVI: compiled step done" t_run
-
-    state.optimizer_state = result.optimizer_state
-    state.iteration += 1
     return state
 end
 

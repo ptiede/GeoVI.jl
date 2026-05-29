@@ -244,7 +244,6 @@ end
         rng, state = init(MersenneTwister(2), problem)
         @test state isa VIState
         @test rng isa MersenneTwister
-        @test state.iteration == 0
         @test size(state.residuals) == (6, 1)
 
         @test_throws ArgumentError update_nonlinear_residual(simple_lh, [0.0], [0.0])
@@ -517,7 +516,6 @@ end
         # in-place step_vi! mutates one VIState
         rng_step, step_state = init(MersenneTwister(5), mgvi_problem)
         step_vi!(rng_step, mgvi_problem, step_state)
-        @test step_state.iteration == 1
         @test size(step_state.residuals, 1) == 8
         @test length(posterior(mgvi_problem, step_state).samples.keys) == 4
 
@@ -533,7 +531,6 @@ end
         for _ in 1:3
             step_vi!(rng, mgvi_problem, state)
         end
-        @test state.iteration == 3
         @test mean(posterior(mgvi_problem, state)) ≈ mean(mgvi_post) atol = 1.0e-12 rtol = 1.0e-12
 
         # rand draws arbitrary new samples from the fitted distribution
@@ -767,15 +764,13 @@ end
                 adtype = GeoVI.ADTypes.AutoEnzyme(),
             )
 
+            # init wraps the host RNG into a ReactantRNG for the compiled path.
             rng, state = init(MersenneTwister(0xfeed), problem)
             @test rng isa Reactant.ReactantRNG
-            for _ in 1:8
-                step_vi!(rng, problem, state)
-            end
-            @test state.iteration == 8
-            @test nameof(typeof(state.cache)) == :ReactantVIStepCache
 
-            post = posterior(problem, state)
+            # `fit` compiles `step_vi!` once (via `_run_vi!(::AutoReactant,...)`)
+            # and loops the compiled thunk.
+            post = fit(problem, 8; rng = MersenneTwister(0xfeed))
             position_host = Array(mean(post))
             @test position_host ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
 
@@ -787,9 +782,15 @@ end
             tr_emp = sum(abs2, centered) / n_samples
             @test tr_emp ≈ tr(setup.Σ_post) rtol = 0.35
 
-            # AutoReactant requires a ReactantRNG; a plain RNG must error.
-            _, bypass_state = init(MersenneTwister(0xfeed), problem)
-            @test_throws ArgumentError step_vi!(MersenneTwister(0), problem, bypass_state)
+            # The user can compile `step_vi!` themselves, passing `n_refine` as a
+            # `ConcreteRNumber` so one compiled graph serves any refinement count.
+            rng2, state2 = init(MersenneTwister(0xfeed), problem)
+            nref = Reactant.ConcreteRNumber(0)
+            cstep = Reactant.@compile step_vi!(rng2, problem, state2, nref)
+            for _ in 1:8
+                cstep(rng2, problem, state2, nref)
+            end
+            @test Array(state2.position) ≈ position_host atol = 1.0f-4 rtol = 0.0
         end
     end
 end

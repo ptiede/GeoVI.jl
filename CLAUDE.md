@@ -34,11 +34,11 @@ GeoVI implements variational inference using Fisher-metric geometry. The key ass
 
 3. **Nonlinear update** (`src/nonlinear.jl`) — Refines linear residuals via Newton-CG or gradient-based optimizers. `NewtonCG` is the recommended optimizer for the inner loop.
 
-4. **Outer VI loop** (`src/vi.jl`) — Coordinates sampling and position optimization, organized as four orthogonal axes (see "Key types"). The primary interface is the in-place loop: `rng, state = init(rng, problem)` then `step_vi!(rng, problem, state)` per iteration, which mutates the one `VIState` and its buffers in place (the user owns the loop, Optimisers.jl-style; `problem` and `rng` are passed in, not stored in the state). `fit(problem, n; rng)` is a convenience that runs `n` iterations and returns a `VariationalPosterior`. Under Reactant the in-place step `_vi_step!` is compiled once at `init` (Reactant traces the mutation directly). A VI step is the **reparameterization structure of VI sliced into three phases** (`src/vi.jl`, unexported primitives the user can compose): `GeoVI.sample!` (draw white noise `ξ_w ∼ N(0,I)` — the only stochastic, `rng`-using phase), `GeoVI.transform!` (de-whiten: MGVI CG solve, geoVI CG + curve, at the current mean — re-running it with the stored noise recomputes the Fisher at a moved mean), `GeoVI.update!` (estimate the KL and move the variational mean). `step_vi!` = `sample!`→`transform!`→`update!`; custom loops (e.g. draw once, then refine the mean against a fixed realization) call the phases directly. `VIState` stores the per-base-draw white noise (`metric_white`/`prior_white`) so `transform!` can replay a draw at a new mean without RNG state.
+4. **Outer VI loop** (`src/vi.jl`) — Coordinates sampling and position optimization, organized as four orthogonal axes (see "Key types"). The primary interface is the in-place loop: `rng, state = init(rng, problem)` then `step_vi!(rng, problem, state)` per iteration, which mutates the one `VIState` and its buffers in place (the user owns the loop, Optimisers.jl-style; `problem` and `rng` are passed in, not stored in the state). `fit(problem, n; rng, n_refine=0)` is a convenience that runs `n` iterations and returns a `VariationalPosterior`. Under Reactant `step_vi!` is a pure in-place mutation with no host-only state, so the user `@compile`s it themselves and loops the compiled thunk (`fit` does this for you: it compiles `step_vi!` once via `_run_vi!`, then loops the thunk on the host). `step_vi!(rng, problem, state, n_refine=0)` runs the cycle once then `n_refine` extra `transform!`→`update!` refinements that reuse the drawn noise (CRN); passing `n_refine` as a `ConcreteRNumber{Int}` keeps it a runtime loop bound so one compiled graph serves any count. A VI step is the **reparameterization structure of VI sliced into three phases** (`src/vi.jl`, unexported primitives the user can compose): `GeoVI.sample!` (draw white noise `ξ_w ∼ N(0,I)` — the only stochastic, `rng`-using phase), `GeoVI.transform!` (de-whiten: MGVI CG solve, geoVI CG + curve, at the current mean — re-running it with the stored noise recomputes the Fisher at a moved mean), `GeoVI.update!` (estimate the KL and move the variational mean). `step_vi!` = `sample!`→`transform!`→`update!` (+ `n_refine` reuse-noise refinements); custom loops (e.g. draw once, then refine the mean against a fixed realization) call the phases directly. `VIState` stores the per-base-draw white noise (`metric_white`/`prior_white`) so `transform!` can replay a draw at a new mean without RNG state.
 
 5. **AD/compilation extensions** (`ext/`) —
    - `GeoVIEnzymeExt.jl` provides `pushforward`/`_value_and_gradient` via Enzyme (`AutoEnzyme`).
-   - `GeoVIReactantExt.jl` compiles the VI step via Reactant for GPU/TPU; uses `AutoReactant` and caches compiled steps in `ReactantVIStepCache`.
+   - `GeoVIReactantExt.jl` runs the VI loop under Reactant for GPU/TPU; uses `AutoReactant`, wraps the rng into a `ReactantRNG` at `init`, and (in `_run_vi!`) `@compile`s `step_vi!` once with a `ConcreteRNumber` `n_refine` then loops the compiled thunk. No persistent compile cache — `step_vi!` is itself the compilable primitive (users can `@compile` it directly).
    Both load automatically when their package is available.
 
 ### Reactant tracing convention (preserve when editing)
@@ -65,7 +65,7 @@ A VI step is: **(1)** draw an MC sample set from `q` at the current mean, **(2)*
 
 - `Samples` — holds `position` (expansion point) and `residuals` (relative to position); `posterior_samples(s)` returns `position .+ residuals`
 - `VariationalProblem` — bundles likelihood + the four axes + adtype (immutable)
-- `VIState` — the mutable *numeric* loop state allocated once by `init` (position, residual buffer, per-base-draw white noise for sample reuse, optimizer state, compile cache); advanced in place by `step_vi!`. The problem and rng are kept *out* of it and passed to `step_vi!` separately
+- `VIState` — the mutable *numeric* loop state allocated once by `init` (position, residual buffer, per-base-draw white noise for sample reuse, optimizer state); advanced in place by `step_vi!`. It holds no host-only fields (no iteration counter, no compile cache), so `step_vi!` is a pure in-place mutation the user can `@compile` directly under Reactant. The problem and rng are kept *out* of it and passed to `step_vi!` separately
 - `VariationalPosterior` — the fitted distribution; supports `rand(rng, post[, n])` and `mean(post)`, and retains the fitting `samples`
 - `ConjugateGradient` — the linear solver; user-facing as a family `solver`, internal inside `NewtonCG`
 - `OptimizationResult` — returned by inner and outer optimizers with convergence info
@@ -97,9 +97,24 @@ for _ in 1:8
 end
 post = posterior(problem, state)
 
-# or the convenience driver:
-post = fit(problem, 8; rng=MersenneTwister(42))
+# or the convenience driver (n_refine extra reuse-noise refinements per step):
+post = fit(problem, 8; rng=MersenneTwister(42), n_refine=0)
 
 draws = rand(MersenneTwister(0), post, 100)   # draw arbitrarily many new samples
 μ     = mean(post)                            # the latent mean
+```
+
+Under Reactant (`xi0` a Reactant array → `AutoReactant`), `step_vi!` is the
+compilable primitive — compile it once and loop the thunk (`fit` does this for
+you). `n_refine` as a `ConcreteRNumber` is a runtime loop bound, so one compiled
+graph serves any count:
+
+```julia
+rng, state = init(MersenneTwister(42), problem)   # rng wrapped into a ReactantRNG
+nref  = Reactant.ConcreteRNumber(3)
+cstep = Reactant.@compile step_vi!(rng, problem, state, nref)
+for _ in 1:8
+    cstep(rng, problem, state, nref)
+end
+post = posterior(problem, state)
 ```

@@ -150,17 +150,38 @@ problem = VariationalProblem(lh, xi0; family, divergence, estimator, optimizer, 
 The primary loop is in place: the user owns the iteration count.
 
 ```julia
-rng, state = init(rng, problem)   # state: one mutable, fully preallocated VIState
+rng, state = init(rng, problem)        # state: one mutable, fully preallocated VIState
 for _ in 1:n
-    step_vi!(rng, problem, state) # mutates state and its buffers in place
+    step_vi!(rng, problem, state)      # mutates state and its buffers in place
 end
 post = posterior(problem, state)
 ```
 
-`fit(problem, n; rng)` is a convenience that runs the loop and returns the
-`VariationalPosterior`. `VariationalProblem` resolves the AD backend once (e.g.
-inferring `AutoReactant` from a Reactant array position). Under Reactant the
-in-place step is compiled, tracing the mutation directly.
+`step_vi!(rng, problem, state, n_refine=0)` takes an optional fourth argument:
+after the fresh `sample!` → `transform!` → `update!` cycle it runs `n_refine`
+extra `transform!` → `update!` refinements that **reuse the drawn noise**
+(recompute the Fisher / re-curve at the moved mean — common random numbers).
+
+`fit(problem, n; rng, n_refine=0)` is a convenience that runs the loop and
+returns the `VariationalPosterior`. `VariationalProblem` resolves the AD backend
+once (e.g. inferring `AutoReactant` from a Reactant array position).
+
+Under Reactant, `step_vi!` is a pure in-place mutation with no host-only state,
+so you compile it yourself and loop the compiled thunk. Passing `n_refine` as a
+`ConcreteRNumber{Int}` keeps it a runtime loop bound, so one compiled graph
+serves any refinement count:
+
+```julia
+rng, state = init(rng, problem)        # rng is wrapped into a ReactantRNG here
+nref  = Reactant.ConcreteRNumber(k)
+cstep = Reactant.@compile step_vi!(rng, problem, state, nref)
+for _ in 1:n
+    cstep(rng, problem, state, nref)
+end
+```
+
+`fit` does exactly this for you on the Reactant path (compile once, loop the
+thunk).
 
 A VI step is the reparameterization structure of VI sliced into three phases,
 exposed as composable (unexported) primitives:
