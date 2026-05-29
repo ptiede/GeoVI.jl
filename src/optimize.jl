@@ -1,6 +1,11 @@
 _option(options, name::Symbol, default) =
     hasproperty(options, name) ? getproperty(options, name) : default
 
+# Fraction of the last outer Newton energy gain the inner CG is asked to reduce
+# its quadratic by, past the first iteration (NIFTy.re's `energy_reduction_factor`).
+# Only used when the optimizer carries an `absdelta`.
+const _CG_ENERGY_REDUCTION = 0.1
+
 """
     AbstractOptimizer
 
@@ -24,12 +29,21 @@ Inexact Newton optimizer whose inner linear system is solved by conjugate
 gradient. The CG keywords configure that intrinsic inner solve directly (a
 `NewtonCG` *is* "Newton with a CG inner solve", so there is no separate
 `ConjugateGradient` to assemble).
+
+Energy-based convergence is opt-in via either `absdelta` (an absolute
+energy-decrease tolerance) or `delta` (the *per-degree-of-freedom* tolerance,
+which becomes `absdelta = delta · length(x0)` at solve time, since the energy is
+a sum over the latent dimensions — cf. NIFTy.re's `delta` convenience). Setting
+`delta` is the easy way to enable both the outer energy-convergence test and the
+inner CG energy-decrease coupling without hand-computing the problem size; pass
+at most one of `absdelta` / `delta`.
 """
-struct NewtonCG{T, A, C} <: AbstractOptimizer
+struct NewtonCG{T, A, D, C} <: AbstractOptimizer
     maxiter::Int
     miniter::Int
     xtol::T
     absdelta::A
+    delta::D
     cg::C
 end
 
@@ -38,6 +52,7 @@ function NewtonCG(;
         miniter = 0,
         xtol = 1.0e-5,
         absdelta = nothing,
+        delta = nothing,
         cg_rtol = 1.0e-8,
         cg_atol = 0.0,
         cg_maxiter = nothing,
@@ -45,10 +60,12 @@ function NewtonCG(;
     )
     maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
+    absdelta === nothing || delta === nothing ||
+        throw(ArgumentError("pass at most one of `absdelta` / `delta`"))
     cg = ConjugateGradient(
         rtol = cg_rtol, atol = cg_atol, maxiter = cg_maxiter, miniter = cg_miniter
     )
-    return NewtonCG(Int(maxiter), Int(miniter), xtol, absdelta, cg)
+    return NewtonCG(Int(maxiter), Int(miniter), xtol, absdelta, delta, cg)
 end
 
 """
@@ -64,6 +81,7 @@ _optimizer_kwargs(o::NewtonCG) = (;
     miniter = o.miniter,
     xtol = o.xtol,
     absdelta = o.absdelta,
+    delta = o.delta,
     cg_rtol = o.cg.rtol,
     cg_atol = o.cg.atol,
     cg_maxiter = o.cg.maxiter,
@@ -406,7 +424,7 @@ end
 function _newton_cg_iter(
         active, x, value, grad, status, iterations, converged,
         objective_evaluations, hessian_evaluations, line_search_steps,
-        cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
+        cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, prev_value, iteration,
     )
     # Eisenstat–Walker forcing sequence (inexact Newton): solve the Newton
     # system only as tightly as the current gradient warrants. Far from the
@@ -414,7 +432,19 @@ function _newton_cg_iter(
     # Target residual norm = min(0.5, √‖g‖) · ‖g‖  (cf. NIFTy.re / SciPy).
     gnorm = norm(grad)
     forcing = min(one(gnorm) / 2, sqrt(gnorm)) * gnorm
-    step, cg_info = solve(cg, v -> metricp(x, v), grad; threshold = forcing)
+    # NIFTy.re energy-decrease coupling, applied ONLY when the optimizer carries
+    # an `absdelta` (calibrated, e.g. via a `delta`-by-size convenience). The
+    # first iteration uses `absdelta/100`; later iterations ask CG to reduce its
+    # quadratic by 10 % of the last outer Newton gain (`prev_value - value`). When
+    # `absdelta === nothing` (the default, e.g. a bare `NewtonCG()` geoVI curve)
+    # this is `nothing`, so CG falls back to the forcing threshold alone.
+    cg_absdelta = absdelta === nothing ? nothing :
+        ifelse(
+            iteration <= 1,
+            absdelta / 100,
+            _CG_ENERGY_REDUCTION * max(zero(value), prev_value - value),
+        )
+    step, cg_info = solve(cg, v -> metricp(x, v), grad; threshold = forcing, absdelta = cg_absdelta)
     cg_ok = !cg_info.breakdown
     cg_iters = cg_info.iterations
 
@@ -463,8 +493,10 @@ function _newton_cg_iter(
     new_he = hessian_evaluations + active_int * (cg_iters + cg_ok_int * he_inc)
     new_lss = line_search_steps + cg_ok_int * ls_steps
 
+    # The entry `value` becomes the next iteration's `prev_value`, keying the
+    # next `cg_absdelta` off this step's actual energy decrease.
     return new_active, new_x, new_value, new_grad, new_status, new_iterations, new_converged,
-        new_oe, new_he, new_lss
+        new_oe, new_he, new_lss, value
 end
 
 function _optimize(
@@ -476,6 +508,7 @@ function _optimize(
         miniter::Integer = 0,
         xtol::Real = 1.0e-5,
         absdelta = nothing,
+        delta = nothing,
         cg_rtol::Real = 1.0e-8,
         cg_atol::Real = 0.0,
         cg_maxiter::Union{Nothing, Integer} = nothing,
@@ -485,6 +518,11 @@ function _optimize(
     )
     maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
+    # `delta` is the per-d.o.f. energy-decrease tolerance; the energy is a sum
+    # over the latent dimensions, so the absolute threshold scales with size.
+    # `length(x0)` is static (a plain `Int`, even under Reactant tracing), so the
+    # resulting `absdelta` is a compile-time-known number.
+    absdelta = absdelta === nothing && delta !== nothing ? delta * length(x0) : absdelta
 
     x = x0
     value, grad = fun_and_grad(x)
@@ -512,6 +550,12 @@ function _optimize(
     iterations = 0
     active = true
     iteration = 0
+    # `prev_value` is loop-carried (it lags `value` by one iteration to feed the
+    # CG energy-coupling). It must be a TracedRNumber under compile AND a node
+    # distinct from `value` — `value + zero(value)` gives a fresh traced node
+    # (plain `prev_value = value` would alias `value`'s node and break Reactant's
+    # `@trace while` carry/result matching).
+    prev_value = value + zero(value)
 
     if within_compile()
         active = promote_to_traced(active)
@@ -528,12 +572,12 @@ function _optimize(
         iteration += 1
         (
             active, x, value, grad, status, iterations, converged,
-            objective_evaluations, hessian_evaluations, line_search_steps,
+            objective_evaluations, hessian_evaluations, line_search_steps, prev_value,
         ) =
             _newton_cg_iter(
             active, x, value, grad, status, iterations, converged,
             objective_evaluations, hessian_evaluations, line_search_steps,
-            cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
+            cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, prev_value, iteration,
         )
     end
 
@@ -560,6 +604,7 @@ function _optimize(
         miniter::Integer = 0,
         xtol::Real = 1.0e-5,
         absdelta = nothing,
+        delta = nothing,
         cg_rtol::Real = 1.0e-8,
         cg_atol::Real = 0.0,
         cg_maxiter::Union{Nothing, Integer} = nothing,
@@ -567,6 +612,8 @@ function _optimize(
         stepnorm = norm,
         optimizer_state = nothing,
     )
+    # `delta`/CG keywords are accepted for a uniform call signature but unused by
+    # a first-order rule (no inner CG, no energy-decrease criterion).
     maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
 

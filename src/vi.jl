@@ -108,13 +108,18 @@ Mutable numeric state for the VI loop: only the evolving quantities, not the
 problem or the RNG (both are passed to [`step_vi!`](@ref) separately). Allocated
 once by [`init`](@ref) with every field at its final type — the iteration
 counter, the current mean (`position`), the residual buffer (`residuals`), the
-threaded `optimizer_state`, and the compilation `cache` — and advanced in place,
-so reusing one `VIState` keeps per-iteration allocation flat.
+stored per-base-draw white noise (`metric_white`, `prior_white`) that
+[`transform!`](@ref GeoVI.transform!) de-whitens (and that custom loops can reuse
+to recompute the transform at a moved mean), the threaded `optimizer_state`, and
+the compilation `cache` — and advanced in place, so reusing one `VIState` keeps
+per-iteration allocation flat.
 """
-mutable struct VIState{P, R, Os, C}
+mutable struct VIState{P, R, M, Pw, Os, C}
     iteration::Int
     position::P
     residuals::R
+    metric_white::M
+    prior_white::Pw
     optimizer_state::Os
     cache::C
 end
@@ -126,6 +131,19 @@ function _init_residual_buffer(problem::VariationalProblem, position)
     return similar(position, (problem.estimator.n_samples, size(position)...))
 end
 
+# Per-base-draw white-noise buffers (one row per base draw): `metric_white` in
+# the likelihood tangent space, `prior_white` in latent space. `sample!` fills
+# them; `transform!` de-whitens them. Stored so a custom loop can replay a draw
+# at a moved mean (recompute the Fisher). `nothing` when there are no samples (MAP).
+function _init_white_buffers(problem::VariationalProblem, position)
+    n = _n_base_draws(problem.estimator)
+    n == 0 && return nothing, nothing
+    tangent = _tangent_template(problem.adtype, problem.likelihood, position)
+    metric_white = similar(tangent, (n, size(tangent)...))
+    prior_white = similar(position, (n, size(position)...))
+    return metric_white, prior_white
+end
+
 # Fresh optimizer state for the chosen optimizer (`nothing` for the stateless
 # `NewtonCG`, an `Optimisers` setup for a rule). Threaded across steps.
 _init_optimizer_state(problem::VariationalProblem, position) =
@@ -134,7 +152,9 @@ _init_optimizer_state(problem::VariationalProblem, position) =
 # Compilation cache, built once at `init`. Eager backends need none (`nothing`);
 # the Reactant extension overrides this to `@compile` the step for the exact
 # preallocated buffers and return a fully-populated, concretely-typed cache.
-_init_cache(_adtype, problem, position, residuals, rng, optimizer_state) = nothing
+_init_cache(
+    _adtype, problem, position, residuals, metric_white, prior_white, rng, optimizer_state
+) = nothing
 
 """
     init([rng], problem) -> (rng, state)
@@ -150,12 +170,17 @@ recompilation on the first iteration). `rng` defaults to `Random.default_rng()`.
 function init(rng::AbstractRNG, problem::VariationalProblem)
     position = copy(problem.initial_samples.position)
     residuals = _init_residual_buffer(problem, position)
+    metric_white, prior_white = _init_white_buffers(problem, position)
     optimizer_state = _init_optimizer_state(problem, position)
     wrapped_rng = _wrap_rng(problem.adtype, rng)
     cache = _init_cache(
-        problem.adtype, problem, position, residuals, wrapped_rng, optimizer_state
+        problem.adtype, problem, position, residuals, metric_white, prior_white,
+        wrapped_rng, optimizer_state,
     )
-    return wrapped_rng, VIState(0, position, residuals, optimizer_state, cache)
+    return wrapped_rng,
+        VIState(
+            0, position, residuals, metric_white, prior_white, optimizer_state, cache,
+        )
 end
 
 init(problem::VariationalProblem; rng::AbstractRNG = Random.default_rng()) =
@@ -328,31 +353,111 @@ function draw_residuals(
         (family = family, mirrored = estimator.mirrored, n_draws = n)
 end
 
-# In-place residual draw used by the stepping kernel: fills the preallocated
-# `residuals` buffer (or does nothing when there are no samples) and returns the
-# sample-state metadata.
-_draw_residuals!(::Nothing, problem::VariationalProblem, position, rng) =
-    (family = problem.family, mirrored = problem.estimator.mirrored, n_draws = 0)
+# ── The three VI phases (composable primitives; unexported) ─────────────────
+#
+# A VI iteration is the reparameterization structure of VI, sliced into phases:
+#   sample!    — draw white noise ξ_w ∼ N(0, I) from the reference distribution.
+#   transform! — de-whiten: apply the family transform at the current mean (MGVI:
+#                CG solve `(I+Fisher)δ = η`; geoVI: + the nonlinear curve) to turn
+#                the stored noise into posterior-sample residuals. Re-running it
+#                with the same stored noise recomputes the Fisher at the new mean.
+#   update!    — estimate the KL with the samples and move the variational mean.
+# `step_vi!` runs sample! → transform! → update!; users can compose them directly
+# (e.g. `sample!` once then `transform!`+`update!` to refine at a fixed noise).
 
-function _draw_residuals!(
-        residuals::AbstractArray,
-        problem::VariationalProblem,
-        position::AbstractArray,
-        rng::AbstractRNG,
+# Phase 1 (array level): fill the white-noise buffers from N(0, I). No-op for a
+# MAP problem (no samples → `nothing` buffers).
+_draw_white_noise!(::Nothing, ::Nothing, ::AbstractRNG) = nothing
+function _draw_white_noise!(metric_white, prior_white, rng::AbstractRNG)
+    copyto!(metric_white, randn_like(rng, metric_white))
+    copyto!(prior_white, randn_like(rng, prior_white))
+    return nothing
+end
+
+# Phase 2 (one base draw): de-whiten the stored noise into a residual block
+# (1 row, or 2 antithetic rows when mirrored). The CG (and geoVI curve) live here.
+# The geoVI curve runs with `throw_on_failure = false` (cf. NIFTy.re's
+# `_raise_notconverged = False`): re-transforming at a converged mean can leave
+# the curve unable to improve an already-optimal residual, which is not an error.
+function _transform_block(family::MGVIFamily, lh, position, ms, mirrored)
+    linear = draw_linear_residual(lh, position, ms; _draw_linear_kwargs(family.solver)...)
+    return mirrored ?
+        _stack_residuals(linear.residual, -linear.residual) :
+        _single_sample_block(linear.residual)
+end
+
+function _transform_block(family::GeoVIFamily, lh, position, ms, mirrored)
+    curve_options = _optimizer_kwargs(family.curve)
+    linear = draw_linear_residual(lh, position, ms; _draw_linear_kwargs(family.solver)...)
+    pos = update_nonlinear_residual(
+        lh, position, linear;
+        optimizer = family.curve, optimizer_options = curve_options, throw_on_failure = false,
     )
+    mirrored || return _single_sample_block(pos.residual)
+    neg = update_nonlinear_residual(
+        lh, position, -linear.residual;
+        metric_sample = ms, metric_sample_sign = -1,
+        optimizer = family.curve, optimizer_options = curve_options, throw_on_failure = false,
+    )
+    return _stack_residuals(pos.residual, neg.residual)
+end
+
+# Phase 2 (array level): de-whiten every base draw's stored noise into `residuals`.
+# No-op for a MAP problem (no samples → `nothing` residuals).
+_transform!(::VariationalProblem, position, ::Nothing, metric_white, prior_white) = nothing
+function _transform!(problem::VariationalProblem, position, residuals, metric_white, prior_white)
     family = problem.family
-    estimator = problem.estimator
     lh = problem.likelihood
-    n = _n_base_draws(estimator)
-
-    first_block, _ = _draw_sample_block(family, lh, position, rng, estimator.mirrored)
-    _write_sample_block!(residuals, 1, first_block)
-
-    @trace track_numbers = false for i in 2:n
-        block, _ = _draw_sample_block(family, lh, position, rng, estimator.mirrored)
-        _write_sample_block!(residuals, i, block)
+    mirrored = problem.estimator.mirrored
+    n = _n_base_draws(problem.estimator)
+    # `@trace for` (track_numbers = false) → one MLIR loop body, not n unrolled
+    # copies of the full CG + forward-model graph.
+    @trace track_numbers = false for i in 1:n
+        mw = _sample_slice(metric_white, i)
+        pw = _sample_slice(prior_white, i)
+        ms = _metric_sample_from_white(lh, position, mw, pw)
+        _write_sample_block!(residuals, i, _transform_block(family, lh, position, ms, mirrored))
     end
-    return (family = family, mirrored = estimator.mirrored, n_draws = n)
+    return residuals
+end
+
+"""
+    sample!(rng, problem, state) -> state
+
+VI phase 1: draw fresh white noise `ξ_w ∼ N(0, I)` into the state buffers. The
+only stochastic phase. No-op for a MAP problem (no samples). Unexported.
+"""
+function sample!(rng::AbstractRNG, problem::VariationalProblem, state::VIState)
+    state.metric_white === nothing && return state
+    _draw_white_noise!(state.metric_white, state.prior_white, rng)
+    return state
+end
+
+"""
+    transform!(problem, state) -> state
+
+VI phase 2: de-whiten the stored noise into sample residuals at the current mean
+(MGVI: CG solve; geoVI: CG + curve). Re-running it (without `sample!`) recomputes
+the Fisher/transform at the moved mean for the same realization. Unexported.
+"""
+function transform!(problem::VariationalProblem, state::VIState)
+    state.residuals === nothing && return state
+    _transform!(problem, state.position, state.residuals, state.metric_white, state.prior_white)
+    return state
+end
+
+"""
+    update!(problem, state) -> state
+
+VI phase 3: estimate the KL with the current samples and move the variational
+mean (the position optimization), writing it back into `state.position`.
+Unexported.
+"""
+function update!(problem::VariationalProblem, state::VIState)
+    result = _optimize_position(problem, state.position, state.residuals, state.optimizer_state)
+    copyto!(state.position, result.x)
+    state.optimizer_state = result.optimizer_state
+    return state
 end
 
 # ── Objective: family × divergence ─────────────────────────────────────────
@@ -545,16 +650,22 @@ end
 # ── Step / fit ─────────────────────────────────────────────────────────────
 
 """
-    _vi_step!(problem, position, residuals, rng, opt_state) -> OptimizationResult
+    _vi_step!(problem, position, residuals, metric_white, prior_white, rng, opt_state)
+        -> OptimizationResult
 
-One VI iteration done in place: draw residuals into `residuals`, optimize the
-mean, and write it back into `position`. `rng` is advanced in place. This is the
-unit compiled by the Reactant extension (Reactant traces the in-place mutation)
-and run directly on the eager path. Returns the `OptimizationResult` (the caller
-keeps only its `optimizer_state` for threading).
+One fresh VI iteration done in place — the three phases inlined: draw white noise
+(phase 1), de-whiten it into `residuals` at the current mean (phase 2), optimize
+the mean and write it back into `position` (phase 3). `rng` is advanced in place.
+This is the unit compiled by the Reactant extension (it traces the in-place
+mutation) and run directly on the eager path. Returns the `OptimizationResult`
+(the caller keeps its `optimizer_state`).
 """
-function _vi_step!(problem::VariationalProblem, position, residuals, rng, opt_state)
-    _draw_residuals!(residuals, problem, position, rng)
+function _vi_step!(
+        problem::VariationalProblem, position, residuals, metric_white, prior_white,
+        rng, opt_state,
+    )
+    _draw_white_noise!(metric_white, prior_white, rng)
+    _transform!(problem, position, residuals, metric_white, prior_white)
     result = _optimize_position(problem, position, residuals, opt_state)
     copyto!(position, result.x)
     return result
@@ -562,7 +673,8 @@ end
 
 function _step_vi!(::Any, rng, problem::VariationalProblem, state::VIState)
     result = _vi_step!(
-        problem, state.position, state.residuals, rng, state.optimizer_state
+        problem, state.position, state.residuals, state.metric_white, state.prior_white,
+        rng, state.optimizer_state,
     )
     state.optimizer_state = result.optimizer_state
     state.iteration += 1
@@ -572,8 +684,11 @@ end
 """
     step_vi!(rng, problem, state::VIState) -> state
 
-Advance the VI loop one iteration in place, reusing `state` and its buffers.
-`rng` is advanced in place; `problem` is the immutable configuration.
+Advance the VI loop one iteration in place, reusing `state` and its buffers: a
+fresh `sample!` → `transform!` → `update!` cycle. `rng` is advanced in place;
+`problem` is the immutable configuration. For custom schedules — e.g. drawing
+once then refining the mean against a fixed realization — compose the phase
+primitives `GeoVI.sample!` / `GeoVI.transform!` / `GeoVI.update!` directly.
 """
 function step_vi!(rng, problem::VariationalProblem, state::VIState)
     _step_vi!(problem.adtype, rng, problem, state)
@@ -583,8 +698,8 @@ end
 """
     fit([rng], problem, n_iterations) -> VariationalPosterior
 
-Convenience driver: run `n_iterations` of [`step_vi!`](@ref) and return the
-fitted [`VariationalPosterior`](@ref). `rng` defaults to `Random.default_rng()`.
+Convenience driver: run `n_iterations` of [`step_vi!`](@ref) and return the fitted
+[`VariationalPosterior`](@ref). `rng` defaults to `Random.default_rng()`.
 """
 function fit(rng::AbstractRNG, problem::VariationalProblem, n_iterations::Integer)
     n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))

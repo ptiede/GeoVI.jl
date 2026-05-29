@@ -1,11 +1,11 @@
-struct ConjugateGradientInfo{C,I,R,B}
+struct ConjugateGradientInfo{C, I, R, B}
     converged::C
     iterations::I
     residual_norm::R
     breakdown::B
 end
 
-function _cg_info(; converged, iterations, residual_norm, breakdown=false)
+function _cg_info(; converged, iterations, residual_norm, breakdown = false)
     # `iterations` may be a plain `Int` (host call) or a `Reactant.TracedRNumber{Int}`
     # (inside a Reactant trace, after the `_maybe_traced` promotion in `_cg_run`).
     # Avoid eagerly casting to `Int` so both paths work; the struct is generic.
@@ -56,38 +56,81 @@ end
 struct ConjugateGradient
     rtol::Float64
     atol::Float64
-    maxiter::Union{Nothing,Int}
+    maxiter::Union{Nothing, Int}
     miniter::Int
+    absdelta::Union{Nothing, Float64}
 end
 
-function ConjugateGradient(; rtol=1e-8, atol=0.0, maxiter=nothing, miniter=0)
+"""
+    ConjugateGradient(; rtol=1e-8, atol=0.0, maxiter=nothing, miniter=0, absdelta=nothing)
+
+Matrix-free CG. Stops when the residual norm drops below `max(atol, rtol·‖b‖)`
+(or an explicit per-call `threshold`). If `absdelta` is set (or passed per call,
+as the Newton-CG outer loop does), CG also stops once the decrease in its
+quadratic energy `φ(x) = ½xᵀAx − bᵀx` between iterations falls below `absdelta`
+— a progress-based criterion that couples inner CG effort to outer optimization
+gains.
+"""
+function ConjugateGradient(; rtol = 1.0e-8, atol = 0.0, maxiter = nothing, miniter = 0, absdelta = nothing)
     rtol >= 0 || throw(ArgumentError("`rtol` must be non-negative"))
     atol >= 0 || throw(ArgumentError("`atol` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
     maxiter !== nothing && maxiter < 0 && throw(ArgumentError("`maxiter` must be non-negative"))
     return ConjugateGradient(
-        Float64(rtol), Float64(atol), maxiter === nothing ? nothing : Int(maxiter), Int(miniter)
+        Float64(rtol),
+        Float64(atol),
+        maxiter === nothing ? nothing : Int(maxiter),
+        Int(miniter),
+        absdelta === nothing ? nothing : Float64(absdelta),
     )
 end
 
-function _cg_iterate(operator, rr, x, r, p, iteration, breakdown, miniter, threshold)
+function _cg_iterate(
+        operator, b, rr, x, r, p, iteration, breakdown, miniter, ad_miniter, threshold, absdelta,
+        energy,
+    )
     Ap = operator(p)
     denom = real(dot(p, Ap))
     x, r, p, rr, residual_norm, valid_step, breakdown_step = _cg_step(denom, rr, x, r, p, Ap)
     iteration += ifelse(valid_step, 1, 0)
     breakdown = breakdown | breakdown_step
     keep_going, converged = _check_conv(iteration, miniter, residual_norm, threshold)
+    # CG quadratic energy φ(x) = ½xᵀAx − bᵀx; with `r = b − Ax` this is
+    # −½·Re⟨x, b + r⟩. Stop once its per-iteration decrease falls below
+    # `absdelta`. The `absdelta === nothing` guard is a COMPILE-TIME type check
+    # (`Nothing` vs a number), resolved at trace time — never a runtime branch on
+    # a traced value. So: with the default `nothing` the extra dot product and
+    # the stop never enter the loop (residual-norm path byte-identical to having
+    # no energy criterion); otherwise `absdelta` may be a plain OR traced number
+    # (the latter from Newton's adaptive coupling), and the comparison goes
+    # through `@trace if`. `ad_miniter` floors the criterion at ~6 iters (NIFTy.re).
+    new_energy = energy
+    if absdelta !== nothing
+        new_energy = -0.5 * real(dot(x, b .+ r))
+        energy_diff = energy - new_energy
+        @trace if (iteration >= ad_miniter) & (energy_diff < absdelta)
+            keep_going = false
+            converged = true
+        end
+    end
     keep_going = valid_step & keep_going
-    return rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm
+    return rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm, new_energy
 end
 
-function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
+function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold, absdelta; x0 = nothing)
     x = x0 === nothing ? zero(b) : copy(x0)
     r = b .- operator(x)
     p = copy(r)
 
     rr = real(dot(r, r))
     residual_norm = sqrt(rr)
+    # Initial CG quadratic energy; only needed when the `absdelta` criterion is
+    # active (the `dot` is skipped otherwise — see `_cg_iterate`). The
+    # `=== nothing` guard is a compile-time type check, not a traced branch.
+    energy = absdelta === nothing ? zero(rr) : -0.5 * real(dot(x, b .+ r))
+    # Minimum iterations before the `absdelta` energy criterion may fire
+    # (NIFTy.re uses `min(6, maxiter)`); honours a larger user `miniter`.
+    ad_miniter = max(miniter, min(6, maxiter))
 
     # Promote loop-carried scalar state to TracedRNumber inside a Reactant
     # trace so the `@trace while` below can use `track_numbers=false`. With
@@ -111,15 +154,18 @@ function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold; x0=nothing)
     end
 
     @trace track_numbers = false while keep_going & (iteration < maxiter)
-        rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm =
-            _cg_iterate(operator, rr, x, r, p, iteration, breakdown, miniter, threshold)
+        rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm, energy =
+            _cg_iterate(
+            operator, b, rr, x, r, p, iteration, breakdown, miniter, ad_miniter, threshold,
+            absdelta, energy,
+        )
     end
     return x, _cg_info(
-        converged=converged,
-        iterations=iteration,
-        residual_norm=residual_norm,
-        breakdown=breakdown,
-    )
+            converged = converged,
+            iterations = iteration,
+            residual_norm = residual_norm,
+            breakdown = breakdown,
+        )
 end
 
 # Identity outside a Reactant trace; inside, lifts a Julia scalar to a
@@ -130,11 +176,15 @@ end
 @inline _maybe_traced(x) = ReactantCore.within_compile() ?
     ReactantCore.promote_to_traced(x) : x
 
-function solve(cg::ConjugateGradient, operator, b; x0=nothing, threshold=nothing)
+function solve(cg::ConjugateGradient, operator, b; x0 = nothing, threshold = nothing, absdelta = nothing)
     miniter = cg.miniter
     maxiter = cg.maxiter === nothing ? max(20, 2 * length(b)) : cg.maxiter
     # An explicit `threshold` (e.g. an Eisenstat–Walker forcing term from the
     # Newton-CG outer loop) overrides the static `atol`/`rtol` criterion.
     thr = threshold === nothing ? max(float(cg.atol), float(cg.rtol) * norm(b)) : threshold
-    return _cg_run(operator, b, maxiter, miniter, thr; x0=x0)
+    # Per-call `absdelta` (e.g. a fraction of the last Newton energy gain)
+    # overrides the static field; `nothing` (either source) disables the energy
+    # criterion via the compile-time `=== nothing` guards in `_cg_run`.
+    ad = absdelta === nothing ? cg.absdelta : absdelta
+    return _cg_run(operator, b, maxiter, miniter, thr, ad; x0 = x0)
 end

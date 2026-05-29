@@ -267,6 +267,35 @@ end
         @test_throws ArgumentError fit(nd_problem, 1; rng = MersenneTwister(1))
     end
 
+    @testset "conjugate gradient stopping" begin
+        # SPD operator A = AᵀΣA + I (the posterior-metric form).
+        rng = MersenneTwister(0xc6)
+        D, M = 80, 40
+        B = randn(rng, M, D) ./ sqrt(D)
+        prec = fill(4.0, M)
+        op = v -> (transpose(B) * (prec .* (B * v))) .+ v
+        b = randn(rng, D)
+        xstar = (transpose(B) * Diagonal(prec) * B + I) \ b
+
+        @test ConjugateGradient(absdelta = 1.0e-3).absdelta == 1.0e-3
+        @test ConjugateGradient().absdelta === nothing
+
+        # Residual-tolerance stop reaches the true solution.
+        x, info = GeoVI.solve(ConjugateGradient(rtol = 1.0e-10), op, b)
+        @test info.converged
+        @test x ≈ xstar atol = 1.0e-6 rtol = 1.0e-6
+
+        # The absdelta energy-decrease criterion stops earlier than a tight
+        # residual tolerance, while still descending toward the solution.
+        x_full, info_full = GeoVI.solve(ConjugateGradient(rtol = 1.0e-14, maxiter = 500), op, b)
+        x_ad, info_ad = GeoVI.solve(
+            ConjugateGradient(rtol = 1.0e-14, maxiter = 500), op, b; absdelta = 1.0e-2
+        )
+        @test info_ad.iterations < info_full.iterations
+        @test info_ad.converged
+        @test norm(op(x_ad) .- b) < norm(b)
+    end
+
     @testset "MGVI linear residuals" begin
         precision = [3.0, 5.0]
         base = GaussianLikelihood([0.0, 0.0]; precision = precision)
@@ -574,6 +603,54 @@ end
         )
     end
 
+    @testset "VI phases (sample! / transform! / update!)" begin
+        D, M = 40, 20
+        setup = _linear_gaussian_setup(MersenneTwister(0x5eed); D = D, M = M, σ² = 0.25)
+        lh = compose(GaussianLikelihood(setup.data; precision = setup.precision), ξ -> setup.A * ξ)
+        solver = ConjugateGradient(rtol = 1.0e-10, maxiter = 200)
+        outer = NewtonCG(maxiter = 20, xtol = 1.0e-9, cg_rtol = 1.0e-10, cg_maxiter = 200)
+        est = MCEstimator(n_samples = 32, mirrored = true)
+
+        # White-noise buffers preallocated at init (one row per base draw).
+        mgvi = VariationalProblem(lh, zeros(D); family = MGVIFamily(solver = solver), estimator = est, optimizer = outer)
+        _, st = init(MersenneTwister(1), mgvi)
+        @test size(st.metric_white) == (16, M)   # n_base = 32 / 2 (mirrored)
+        @test size(st.prior_white) == (16, D)
+
+        geovi = VariationalProblem(
+            lh, zeros(D);
+            family = GeoVIFamily(solver = solver, curve = NewtonCG(cg_rtol = 1.0e-10, cg_maxiter = 200)),
+            estimator = est, optimizer = outer,
+        )
+
+        # `sample!` is the only stochastic phase; `transform!` is a deterministic
+        # function of the stored noise + mean, so two transforms at the same mean
+        # give the same residuals (this is what enables recompute-Fisher reuse).
+        rng, s = init(MersenneTwister(7), geovi)
+        GeoVI.sample!(rng, geovi, s)
+        GeoVI.transform!(geovi, s)
+        r1 = copy(s.residuals)
+        GeoVI.transform!(geovi, s)        # same noise, same mean → identical
+        @test s.residuals ≈ r1
+        GeoVI.sample!(rng, geovi, s)      # fresh noise → generally different
+        GeoVI.transform!(geovi, s)
+        @test !(s.residuals ≈ r1)
+
+        # geoVI converges via the recompute-Fisher refinement: draw the noise once,
+        # then re-`transform!` (recompute the Fisher at the moved mean) + `update!`.
+        rng2, s2 = init(MersenneTwister(9), geovi)
+        GeoVI.sample!(rng2, geovi, s2)
+        for _ in 1:8
+            GeoVI.transform!(geovi, s2)
+            GeoVI.update!(geovi, s2)
+        end
+        @test mean(posterior(geovi, s2)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
+
+        # `step_vi!` (a fresh sample!+transform!+update! per call) also converges.
+        post = fit(geovi, 8; rng = MersenneTwister(9))
+        @test mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
+    end
+
     @testset "linear-Gaussian conjugate end-to-end" begin
         rng = MersenneTwister(0x000a11ce)
         D, M = 100, 50
@@ -622,6 +699,43 @@ end
             rcentered = rdraws .- mean(rdraws; dims = 1)
             @test sum(abs2, rcentered) / n_rand ≈ tr(setup.Σ_post) rtol = 0.3
         end
+
+        # geoVI with the NIFTy-style CG energy-decrease coupling switched on:
+        # a calibrated `absdelta = delta·D` on both the curve and the outer
+        # Newton makes the inner CG stop on quadratic-energy progress. This must
+        # stay stable (no line-search failure) and still recover the posterior.
+        ad = 1.0e-4 * D
+        coupled = GeoVIFamily(
+            solver = solver, curve = NewtonCG(absdelta = ad, cg_rtol = 1.0e-10, cg_maxiter = 200)
+        )
+        coupled_problem = VariationalProblem(
+            lh,
+            xi0;
+            family = coupled,
+            divergence = ReverseKL(),
+            estimator = est,
+            optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, absdelta = ad, cg_rtol = 1.0e-10, cg_maxiter = 200),
+        )
+        coupled_post = fit(coupled_problem, 8; rng = MersenneTwister(2025))
+        @test mean(coupled_post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
+
+        # The `delta` convenience (per-d.o.f. tolerance) must be exactly
+        # equivalent to `absdelta = delta·length(x0)`.
+        delta = 1.0e-4
+        @test_throws ArgumentError NewtonCG(absdelta = 1.0, delta = 1.0)
+        delta_fam = GeoVIFamily(
+            solver = solver, curve = NewtonCG(delta = delta, cg_rtol = 1.0e-10, cg_maxiter = 200)
+        )
+        delta_problem = VariationalProblem(
+            lh,
+            xi0;
+            family = delta_fam,
+            divergence = ReverseKL(),
+            estimator = est,
+            optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, delta = delta, cg_rtol = 1.0e-10, cg_maxiter = 200),
+        )
+        delta_post = fit(delta_problem, 8; rng = MersenneTwister(2025))
+        @test mean(delta_post) ≈ mean(coupled_post) atol = 1.0e-12 rtol = 1.0e-12
     end
 
     @testset "Reactant extension" begin

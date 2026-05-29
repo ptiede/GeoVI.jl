@@ -17,9 +17,8 @@ const _ReactantArray = Union{Reactant.ConcreteRArray, Reactant.TracedRArray}
 # Int/Float64/Bool fields as compile-time constants, and the hot loops use
 # `@trace ... track_numbers=false` so the deep number-walk is suppressed there.
 
-# Holds the compiled in-place step. Built once at `init` (see `_init_cache`)
-# for the exact preallocated buffers, so `step` is a concrete compiled thunk —
-# no `Any`, no recompilation on the first iteration.
+# Holds the compiled `_vi_step!`, built once at `init` (see `_init_cache`) for the
+# exact preallocated buffers — one concrete thunk, no `Any`, no recompilation.
 struct ReactantVIStepCache{F}
     step::F
 end
@@ -172,9 +171,14 @@ function GeoVI._wrap_rng(::ADTypes.AutoReactant, rng::AbstractRNG)
     return Reactant.ReactantRNG(Reactant.to_rarray(seed))
 end
 
+# Size the white-noise buffer under `@jit`: the tangent template runs the forward
+# model (e.g. a matmul on `ConcretePJRTArray`), which cannot execute eagerly.
+GeoVI._tangent_template(::ADTypes.AutoReactant, lh::GeoVI.AbstractLikelihood, xi) =
+    @jit(GeoVI._metric_tangent_template(lh, xi))
+
 function GeoVI._init_cache(
         ::ADTypes.AutoReactant, problem::GeoVI.VariationalProblem,
-        position, residuals, rng, optimizer_state,
+        position, residuals, metric_white, prior_white, rng, optimizer_state,
     )
     rng isa Reactant.ReactantRNG || throw(
         ArgumentError(
@@ -185,26 +189,31 @@ function GeoVI._init_cache(
     )
     @info "GeoVI: compiling step_vi!..."
     t_compile = @elapsed begin
-        step = @compile GeoVI._vi_step!(problem, position, residuals, rng, optimizer_state)
+        step = @compile GeoVI._vi_step!(
+            problem, position, residuals, metric_white, prior_white, rng, optimizer_state
+        )
     end
     @info "GeoVI: compilation done" t_compile
     return ReactantVIStepCache(step)
 end
 
-function GeoVI._step_vi!(::ADTypes.AutoReactant, rng, problem::GeoVI.VariationalProblem, state::GeoVI.VIState)
+function GeoVI._step_vi!(
+        ::ADTypes.AutoReactant, rng, problem::GeoVI.VariationalProblem, state::GeoVI.VIState,
+    )
     rng isa Reactant.ReactantRNG || throw(
         ArgumentError(
             "AutoReactant requires the `Reactant.ReactantRNG` returned by `init`; " *
                 "got $(typeof(rng)).",
         )
     )
-    # The cache's compiled step was built at `init` for these exact buffers; it
-    # mutates `position`/`residuals`/`rng` in place and returns the
-    # OptimizationResult, of which we keep only the threaded optimizer state.
+    # The compiled step (built at `init` for these exact buffers) runs the three
+    # phases, mutating position/residuals/white-noise/rng in place and returning
+    # the OptimizationResult; we keep its threaded optimizer state.
     @debug "GeoVI: running compiled step..."
     t_run = @elapsed begin
         result = state.cache.step(
-            problem, state.position, state.residuals, rng, state.optimizer_state
+            problem, state.position, state.residuals, state.metric_white,
+            state.prior_white, rng, state.optimizer_state,
         )
     end
     @debug "GeoVI: compiled step done" t_run

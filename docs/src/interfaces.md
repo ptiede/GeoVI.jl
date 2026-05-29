@@ -99,7 +99,10 @@ objective.
 GeoVI accepts, as the outer position optimizer:
 
 - built-in optimizers that subtype `AbstractOptimizer` (`NewtonCG`), which run to
-  convergence within one position update
+  convergence within one position update. `NewtonCG` enables energy-based
+  convergence (and the inner-CG energy-decrease coupling) when given `absdelta`
+  (absolute) or `delta` (per-degree-of-freedom; `absdelta = delta·length(x0)` at
+  solve time, since the energy is a sum over latent dimensions)
 - a bare `Optimisers.AbstractRule` (e.g. `Optimisers.Adam(0.05)`), which takes a
   single gradient step per `step_vi!` — the user's loop provides the iterations
 
@@ -158,6 +161,30 @@ post = posterior(problem, state)
 `VariationalPosterior`. `VariationalProblem` resolves the AD backend once (e.g.
 inferring `AutoReactant` from a Reactant array position). Under Reactant the
 in-place step is compiled, tracing the mutation directly.
+
+A VI step is the reparameterization structure of VI sliced into three phases,
+exposed as composable (unexported) primitives:
+
+- `GeoVI.sample!(rng, problem, state)` — draw white noise `ξ_w ∼ N(0, I)`. The
+  only stochastic phase.
+- `GeoVI.transform!(problem, state)` — de-whiten: apply the family transform at
+  the current mean (MGVI: CG solve; geoVI: CG + nonlinear curve) to turn the
+  stored noise into sample residuals. Re-running it (without `sample!`) recomputes
+  the Fisher/transform at the moved mean for the same realization.
+- `GeoVI.update!(problem, state)` — estimate the KL and move the variational mean.
+
+`step_vi!` runs `sample!` → `transform!` → `update!`. For custom schedules — e.g.
+draw once, then refine the mean against a fixed realization (recompute-Fisher) —
+compose the phases directly:
+
+```julia
+rng, state = init(rng, problem)
+GeoVI.sample!(rng, problem, state)
+for _ in 1:k
+    GeoVI.transform!(problem, state)   # recompute the Fisher at the moved mean
+    GeoVI.update!(problem, state)
+end
+```
 
 ## AD Backends
 

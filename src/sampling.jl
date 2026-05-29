@@ -30,6 +30,12 @@ end
 _n_base_draws(e::MCEstimator) = e.mirrored ? (e.n_samples ÷ 2) : e.n_samples
 
 _metric_tangent_template(lh::AbstractLikelihood, xi) = normalized_residual(lh, xi)
+
+# Evaluate the metric tangent template to size the white-noise buffer at `init`.
+# Plain backends run it eagerly; the Reactant extension overrides this to run it
+# under `@jit`, because the forward model (e.g. a matmul on `ConcretePJRTArray`)
+# cannot execute eagerly outside a compiled region.
+_tangent_template(_adtype, lh::AbstractLikelihood, xi) = _metric_tangent_template(lh, xi)
 _posterior_metric(lh::AbstractLikelihood, xi, v) = fishermetric(lh, xi, v) .+ v
 
 struct _PosteriorMetricOperator{L, X}
@@ -51,9 +57,23 @@ end
 
 function draw_metric_sample(lh::AbstractLikelihood, xi, rng::AbstractRNG)
     metric_white = randn_like(rng, _metric_tangent_template(lh, xi))
-    likelihood_sample = leftsqrtmetric(lh, xi, metric_white)
     prior_sample = randn_like(rng, xi)
-    return MetricSample(likelihood_sample .+ prior_sample, prior_sample)
+    return _metric_sample_from_white(lh, xi, metric_white, prior_sample)
+end
+
+"""
+    _metric_sample_from_white(lh, xi, metric_white, prior_white)
+
+Assemble a [`MetricSample`](@ref) from already-drawn, position-independent white
+noise: `metric_white` in the likelihood tangent space and `prior_white` in latent
+space. The left square-root metric is (re-)applied at the current `xi`, so the same
+white noise yields a *consistent* metric sample at any expansion point — this is
+what lets [`transform!`](@ref GeoVI.transform!) reproduce a draw at a moved mean
+(recompute the Fisher) from the stored noise, without RNG state.
+"""
+function _metric_sample_from_white(lh::AbstractLikelihood, xi, metric_white, prior_white)
+    likelihood_sample = leftsqrtmetric(lh, xi, metric_white)
+    return MetricSample(likelihood_sample .+ prior_white, prior_white)
 end
 
 function _resolve_metric_sample(metric_sample, prior_sample)
