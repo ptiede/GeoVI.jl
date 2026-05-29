@@ -299,8 +299,10 @@ engine is chosen. Instead of a custom backend trait, the user should specify an
 
 That keeps the surface cleaner:
 
-- `family`, `divergence`, and `optimizer` are explicit algorithm choices
-- `VIConfig` holds tuning knobs like sample counts and tolerances
+- `family`, `divergence`, `estimator`, and `optimizer` are explicit algorithm
+  choices passed directly to `VariationalProblem` (the four orthogonal axes;
+  there is no `VIConfig` — the `estimator` holds sample counts, the family/optimizer
+  hold their tolerances)
 - `adtype` selects the differentiation engine via `ADTypes`
 
 Reactant should still not require a separate public backend hierarchy. If the
