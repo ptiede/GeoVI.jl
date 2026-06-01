@@ -7,15 +7,21 @@
 # likelihood always consumes a latent point ξ. The reparameterization `T_θ` is sliced at
 # the boundary between what is *frozen* at the current θ and what is *differentiated*:
 #
-#   transform_block — the frozen prefix, evaluated at the current θ and held constant,
-#                     producing a stored residual. Trivial (`= ε`) for pushforward
-#                     families; a CG solve (+ curve) for the Fisher-Gaussian families.
-#   transport         — the differentiated suffix, reconstructing ξ from θ + residual.
+#   draw_samples!        — the frozen prefix: fill the residual buffer with a Monte-Carlo
+#                          set drawn at the current θ and held constant during the update.
+#                          IID white noise for pushforward families; a CG solve (+ curve)
+#                          for the Fisher-Gaussian families.
+#   transport_and_logjac — the differentiated suffix, reconstructing ξ from θ + residual AND
+#                          returning the reparameterization's log-Jacobian (its log q term).
+#
+# The VI loop is `draw_samples! → update!`: draw the samples once, then optimize θ against
+# that fixed set (one `Optimisers` step, or `NewtonCG` to convergence), then resample on
+# the next outer step — the same `draw → optimize-fixed-samples → resample` loop NIFTy uses.
 #
 # REQUIRED of a new family: `init_params` and (unless θ is itself the latent point)
-# `transport`. Every other hook below has a default targeting the pushforward/common case
-# (mean-field, normalizing flows). Concrete families live in the sibling files
-# (`mgvi.jl`, `geovi.jl`, `fisher_gaussian.jl`, `meanfield.jl`).
+# `transport_and_logjac`. Every other hook below has a default targeting the
+# pushforward/common case (mean-field, normalizing flows). Concrete families live in the
+# sibling files (`mgvi.jl`, `geovi.jl`, `fisher_gaussian.jl`, `meanfield.jl`).
 # ════════════════════════════════════════════════════════════════════════════
 
 """
@@ -28,13 +34,13 @@ outer-optimization or Monte-Carlo-budget knobs — those live on the
 [`MCEstimator`](@ref) estimator and the optimizer respectively.
 
 To add a family, subtype `AbstractVariationalFamily` and implement
-`GeoVI.init_params` and `GeoVI.transport` (the latter only if `θ` is not
-itself the latent point). Optional hooks, each with a default targeting the
-pushforward case (mean-field, normalizing flows): `GeoVI.logdensity`
-(the family's log-density `log q_θ`; `0`/no-op by default), `GeoVI.transform_block` /
-`GeoVI.init_noise` / `GeoVI.draw_noise` (the frozen draw; identity /
-single latent buffer by default), and — only to enable the `NewtonCG` optimizer —
-`GeoVI.supports_natural_gradient` + `GeoVI.natural_gradient_metric`.
+`GeoVI.init_params` and `GeoVI.transport_and_logjac` (the latter only if `θ` is not
+itself the latent point). `transport_and_logjac(family, θ, r) -> (ξ, logjac)` returns both
+the reconstructed latent point and the reparameterization's log-Jacobian `log|det J|` (the
+variational entropy term). Optional hooks, each with a default targeting the pushforward
+case (mean-field, normalizing flows): `GeoVI.draw_samples!` (the frozen draw; fills the
+residual buffer with IID white noise by default), and — only to enable the `NewtonCG`
+optimizer — `GeoVI.supports_natural_gradient` + `GeoVI.natural_gradient_metric`.
 """
 abstract type AbstractVariationalFamily end
 
@@ -43,53 +49,47 @@ abstract type AbstractVariationalFamily end
 # Build θ from the user's initial latent point.
 init_params(::AbstractVariationalFamily, initial_latent) = copy(initial_latent)
 
-# Reconstruct a latent point ξ from θ and one stored residual. DIFFERENTIATED through θ,
-# so a structured θ stays differentiable. Default: θ is itself the latent point.
-transport(::AbstractVariationalFamily, θ, residual) = θ .+ residual
+# Reconstruct a latent point ξ from θ + one stored residual, AND return the
+# reparameterization's log-Jacobian `log|det J|` — the variational entropy term, so the
+# reverse-KL objective is `mean_i[-log p(ξ_i) - logjac_i]`. Returns `(ξ, logjac)`, both
+# DIFFERENTIATED through θ (so a structured θ stays differentiable, and a normalizing flow
+# produces ξ and its `log|det J|` from one forward pass). Default: θ is itself the latent
+# point, so `ξ = θ .+ residual` and `logjac = 0` — the Fisher-Gaussian fixed-metric
+# approximation (the metric's log-determinant is intractable and held constant, so it drops).
+transport_and_logjac(::AbstractVariationalFamily, θ, residual) = (θ .+ residual, zero(eltype(residual)))
 
-# ── The frozen draw (`transform_block`) and the white noise it consumes ──────
+# ── The frozen draw (`draw_samples!`) ────────────────────────────────────────
 #
-# `transform_block(family, lh, θ, noise_i, mirrored)` de-whitens ONE base draw's noise
-# into a residual block (1 row, or 2 antithetic rows when `mirrored`) at the current θ —
-# the *frozen* part of the reparameterization. `draw_noise`/`init_noise` declare and
-# fill the white noise it consumes.
+# `draw_samples!(family, lh, θ, residuals, rng, mirrored)` fills the preallocated
+# `residuals` buffer (`(n_samples, latent…)`) with one Monte-Carlo set drawn at the current
+# θ — the *frozen* part of the reparameterization, held constant during the `update!` that
+# follows. The family owns its rng use and its loop; `mirrored` packs antithetic ±ε pairs
+# (interleaved per base draw). The buffer's leading dimension is the sample count, so the
+# number of base draws is `size(residuals, 1) ÷ (mirrored ? 2 : 1)`.
 
 # Default (pushforward families — mean-field, normalizing flows): the frozen prefix is the
-# identity, so the stored residual *is* the white noise ε (the work happens in `transport`).
-transform_block(::AbstractVariationalFamily, lh::AbstractLikelihood, θ, ε, mirrored::Bool) =
-    mirrored ? _stack_residuals(ε, -ε) : _single_sample_block(ε)
-
-# The family's per-base-draw white-noise bundle, sized for `n` base draws. DEFAULT: a
-# single latent-shaped buffer ε (the pushforward case). `latent` is a latent-shaped
-# template (the user's initial ξ₀). The bundle may be any Functors-traversable structure
-# of arrays; `sample!` fills every leaf and `transform!` slices each per base draw.
-init_noise(::AbstractVariationalFamily, adtype, lh, latent, n) =
-    similar(latent, (n, size(latent)...))
-
-# Default single fresh white-noise draw (backs `rand`): a latent-shaped ε. A structured-θ
-# family overrides it to draw in latent shape.
-draw_noise(::AbstractVariationalFamily, lh::AbstractLikelihood, θ, rng::AbstractRNG) =
-    randn_like(rng, θ)
-
-# ── The family's log-density `log q_θ(ξ)` ────────────────────────────────────
-
-# The per-sample variational log-density `log q_θ(ξ)` at the drawn sample
-# `ξ = transport(family, θ, ε)`, written as a function of the reparam noise ε (the same
-# object `transport` consumes — cheaper than re-deriving ε from ξ, and a flow gets its
-# `log|det J|` straight from the forward pass). Returned up to a global additive constant
-# (the normalization), which no f-divergence's reduction depends on.
-#
-# This is the family's contribution to every f-divergence objective: the reverse KL is
-# `J(θ) = mean_i[-log p(ξ_i) + logdensity(family, θ, ε_i)]`, and a general f-divergence
-# combines the per-sample log density-ratio `w_i = log p(ξ_i) - logdensity(family, θ, ε_i)`.
-#
-# Default `false` (a typed zero, so `x + false === x` and the term vanishes): the family
-# contributes no varying log-density. For the Fisher-Gaussian families (MGVI/geoVI) this
-# is the *fixed-metric approximation* — the covariance is pinned to `(I + Fisher(μ))⁻¹` and
-# its entropy is held constant, so the gradient is 0 (they have no tractable `log q` to
-# form anyway). Families with a tractable density override it (mean-field below; a
-# normalizing flow returns `-½‖ε‖² - log|det J_θ|`). Extends the likelihood's `logdensity`.
-logdensity(::AbstractVariationalFamily, θ, ε) = zero(eltype(ε))
+# identity, so the stored residual *is* white noise ε (the work happens in
+# `transport_and_logjac`). The bulk `randn` is drawn OUTSIDE any `@trace` (the rng never
+# enters a traced loop), so this compiles under Reactant unchanged.
+function draw_samples!(
+        ::AbstractVariationalFamily, lh::AbstractLikelihood, θ, residuals, rng::AbstractRNG,
+        mirrored::Bool,
+    )
+    if !mirrored
+        # One bulk draw fills the whole buffer (each row an independent ε).
+        copyto!(residuals, randn_like(rng, residuals))
+        return residuals
+    end
+    # Antithetic: draw the `n` base ε's in one shot (rng outside `@trace`), then write the
+    # ±ε pairs — the `@trace for` slices/writes only (no rng inside the traced loop).
+    n = size(residuals, 1) ÷ 2
+    white = randn_like(rng, similar(residuals, (n, Base.tail(size(residuals))...)))
+    @trace track_numbers = false for i in 1:n
+        ε = _sample_slice(white, i)
+        _write_sample_block!(residuals, i, _stack_residuals(ε, -ε))
+    end
+    return residuals
+end
 
 # ── Natural-gradient metric (an *optimizer* concern, not a family property) ──
 #

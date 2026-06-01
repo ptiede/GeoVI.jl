@@ -1,7 +1,7 @@
 # ── MeanFieldGaussian ────────────────────────────────────────────────────────
-# Mean-field ADVI — a pushforward family. It takes the default identity `transform_block`,
-# the default single-latent-buffer `init_noise`, and overrides the differentiated suffix
-# (`transport`), the log-density (`logdensity`), and the structured-θ helpers.
+# Mean-field ADVI — a pushforward family. It takes the default `draw_samples!` (the stored
+# residual is raw white noise ε) and overrides only the differentiated suffix
+# `transport_and_logjac` (which returns both the sample and its log-Jacobian) and `init_params`.
 
 """
     MeanFieldGaussian()
@@ -18,20 +18,15 @@ yet). The objective is the ELBO, dispatched as `(MeanFieldGaussian, ReverseKL)`.
 """
 struct MeanFieldGaussian <: AbstractVariationalFamily end
 
-# θ = `(; mean = μ, logstd = log σ)`; the σ-scaling lives in `transport` (so `logstd` is
-# differentiated through), while the frozen prefix stays the default identity (the stored
-# residual is the raw white noise ε).
+# θ = `(; mean = μ, logstd = log σ)`; the σ-scaling lives in `transport_and_logjac` (so
+# `logstd` is differentiated through), while the frozen prefix stays the default
+# `draw_samples!` (the stored residual is the raw white noise ε).
 init_params(::MeanFieldGaussian, initial_latent) =
     (; mean = copy(initial_latent), logstd = zero(initial_latent))
-transport(::MeanFieldGaussian, θ, ε) = θ.mean .+ exp.(θ.logstd) .* ε
-draw_noise(::MeanFieldGaussian, lh::AbstractLikelihood, θ, rng::AbstractRNG) =
-    randn_like(rng, θ.mean)
 
-# `log q_θ(ξ)` for `q = N(μ, diag σ²)` with `ξ = μ + σ⊙ε`, i.e. `-½‖ε‖² - Σ logσ` (up to the
-# global `-(d/2)·log2π` constant, dropped — it never affects an f-divergence's reduction).
-# Only `-Σ logσ` carries a θ-gradient; `-½‖ε‖²` is per-sample but θ-independent (needed by
-# nonlinear divergences like Rényi, gradient-free for reverse KL).
-logdensity(::MeanFieldGaussian, θ, ε) = -sum(θ.logstd) - sum(abs2, ε) / 2
+# `ξ = μ + σ⊙ε`, with log-Jacobian `log|det diag(σ)| = Σ logσ` (the entropy term: the
+# reverse-KL objective subtracts it, giving the familiar `-Σ logσ`).
+transport_and_logjac(::MeanFieldGaussian, θ, ε) = (θ.mean .+ exp.(θ.logstd) .* ε, sum(θ.logstd))
 
 # ── The fitted distribution: a self-contained diagonal Gaussian ──────────────
 # Needs no likelihood to sample, and (unlike the Fisher-Gaussian families) has a tractable

@@ -602,7 +602,7 @@ end
         )
     end
 
-    @testset "VI phases (sample! / transform! / update!)" begin
+    @testset "VI phases (draw_samples! / update!)" begin
         D, M = 40, 20
         setup = _linear_gaussian_setup(MersenneTwister(0x5eed); D = D, M = M, σ² = 0.25)
         lh = compose(GaussianLikelihood(setup.data; precision = setup.precision), ξ -> setup.A * ξ)
@@ -610,11 +610,10 @@ end
         outer = NewtonCG(maxiter = 20, xtol = 1.0e-9, cg_rtol = 1.0e-10, cg_maxiter = 200)
         est = MCEstimator(n_samples = 32, mirrored = true)
 
-        # White-noise buffers preallocated at init (one row per base draw).
+        # The residual buffer is preallocated at init: (n_samples, latent...).
         mgvi = VariationalProblem(lh, zeros(D); family = MGVIFamily(solver = solver), estimator = est, optimizer = outer)
         _, st = init(MersenneTwister(1), mgvi)
-        @test size(st.noise.metric) == (16, M)   # n_base = 32 / 2 (mirrored)
-        @test size(st.noise.prior) == (16, D)
+        @test size(st.residuals) == (32, D)
 
         geovi = VariationalProblem(
             lh, zeros(D);
@@ -622,30 +621,25 @@ end
             estimator = est, optimizer = outer,
         )
 
-        # `sample!` is the only stochastic phase; `transform!` is a deterministic
-        # function of the stored noise + mean, so two transforms at the same mean
-        # give the same residuals (this is what enables recompute-Fisher reuse).
+        # `draw_samples!` is the stochastic phase: it fills the residual buffer, and two
+        # successive draws (fresh noise) generally differ.
         rng, s = init(MersenneTwister(7), geovi)
-        GeoVI.sample!(rng, geovi, s)
-        GeoVI.transform!(geovi, s)
+        GeoVI.draw_samples!(rng, geovi, s)
+        @test size(s.residuals) == (32, D)
         r1 = copy(s.residuals)
-        GeoVI.transform!(geovi, s)        # same noise, same mean → identical
-        @test s.residuals ≈ r1
-        GeoVI.sample!(rng, geovi, s)      # fresh noise → generally different
-        GeoVI.transform!(geovi, s)
+        GeoVI.draw_samples!(rng, geovi, s)
         @test !(s.residuals ≈ r1)
 
-        # geoVI converges via the recompute-Fisher refinement: draw the noise once,
-        # then re-`transform!` (recompute the Fisher at the moved mean) + `update!`.
+        # The loop is `draw_samples! → update!`: draw a fresh set each iteration, optimize
+        # the mean against it (NewtonCG to convergence), and the mean reaches the posterior.
         rng2, s2 = init(MersenneTwister(9), geovi)
-        GeoVI.sample!(rng2, geovi, s2)
         for _ in 1:8
-            GeoVI.transform!(geovi, s2)
+            GeoVI.draw_samples!(rng2, geovi, s2)
             GeoVI.update!(geovi, s2)
         end
         @test _post_mean(distribution(geovi, s2)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
 
-        # `step_vi!` (a fresh sample!+transform!+update! per call) also converges.
+        # `step_vi!` (a fresh draw_samples!+update! per call) also converges.
         post = fit(geovi, 8; rng = MersenneTwister(9))
         @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
     end
@@ -733,8 +727,8 @@ end
         # ── interface defaults: for MGVI/geoVI θ *is* the latent point ──
         xi = [0.3, -0.7, 1.2]
         r = [0.1, 0.2, -0.1]
-        @test GeoVI.transport(MGVIFamily(), xi, r) == r .+ xi          # default transport: θ .+ residual
-        @test GeoVI.logdensity(MGVIFamily(), xi, r) == false  # fixed-metric: no log q term
+        # default transport_and_logjac: ξ = θ .+ residual, logjac = 0 (fixed-metric)
+        @test GeoVI.transport_and_logjac(MGVIFamily(), xi, r) == (r .+ xi, zero(eltype(r)))
         ip = GeoVI.init_params(MGVIFamily(), xi)
         @test ip == xi && ip !== xi   # a fresh copy
 
@@ -771,9 +765,9 @@ end
         rng_i, st = init(MersenneTwister(0xfeed), mf)
         @test st.position isa NamedTuple
         @test keys(st.position) == (:mean, :logstd)
-        # mean-field: the default noise bundle is a single latent ε buffer (no metric noise).
-        @test st.noise isa AbstractArray
-        @test size(st.noise) == (64, D)          # n_base = 128 / 2 (mirrored)
+        # mean-field: the residual buffer is latent-shaped white noise (n_samples, latent).
+        @test st.residuals isa AbstractArray
+        @test size(st.residuals) == (128, D)
 
         post = fit(mf, 3000; rng = MersenneTwister(0xfeed))
         # Mean-field recovers the exact posterior mean; its marginal σ is the
@@ -812,19 +806,17 @@ end
 
     @testset "custom pushforward family (minimal interface)" begin
         # A brand-new family that is NOT one of the built-ins, implementing ONLY the
-        # general pushforward surface — `init_params` + `transport` + `logdensity` — and no
+        # general pushforward surface — `init_params` + `transport_and_logjac` — and no
         # Fisher-Gaussian / metric machinery. It is a diagonal Gaussian with a single
         # *shared* scalar log-scale (distinct from mean-field's per-coordinate σ), which
-        # exercises a structured θ reconstructed through `transport`. Proving it runs through
-        # `fit` with a bare `Optimisers.jl` rule is the point of the refactor.
+        # exercises a structured θ reconstructed through `transport_and_logjac`. Proving it
+        # runs through `fit` with a bare `Optimisers.jl` rule is the point of the refactor.
         struct ScalarScaleGaussian <: GeoVI.AbstractVariationalFamily end
         GeoVI.init_params(::ScalarScaleGaussian, x) =
             (; mean = copy(x), logs = fill(zero(eltype(x)), 1))
-        GeoVI.transport(::ScalarScaleGaussian, θ, ε) = θ.mean .+ exp(θ.logs[1]) .* ε
-        # log q_θ(ξ) for q = N(μ, σ²I), σ = exp(logs), ξ = μ + σ⊙ε: `-½‖ε‖² - D·logs` (the
-        # θ-gradient comes from `-D·logs`; `-½‖ε‖²` is the per-sample part the genuine
-        # density carries, up to the dropped global constant).
-        GeoVI.logdensity(::ScalarScaleGaussian, θ, ε) = -length(θ.mean) * θ.logs[1] - sum(abs2, ε) / 2
+        # ξ = μ + σ⊙ε with σ = exp(logs) (shared scalar); log-Jacobian = log|det diag(σ)| = D·logs.
+        GeoVI.transport_and_logjac(::ScalarScaleGaussian, θ, ε) =
+            (θ.mean .+ exp(θ.logs[1]) .* ε, length(θ.mean) * θ.logs[1])
         # the fitted distribution (the first-class output) is the family's own type:
         struct ScalarScaleDist{V, T} <: GeoVI.AbstractVariationalDistribution
             mean::V
@@ -844,12 +836,12 @@ end
             family = ScalarScaleGaussian(),
             estimator = MCEstimator(n_samples = 64, mirrored = true),
             optimizer = Optimisers.Adam(0.05),
-        )   # no solver, no metric — defaults supply transform_block/init_noise.
+        )   # no solver, no metric — the default `draw_samples!` supplies white noise.
 
-        # Init uses the default single-latent-buffer noise (no metric tangent), sized from ξ₀.
+        # Init allocates the latent-shaped residual buffer (white noise; no metric tangent).
         rng_i, st = init(MersenneTwister(0x1), problem)
         @test st.position isa NamedTuple && keys(st.position) == (:mean, :logs)
-        @test st.noise isa AbstractArray && size(st.noise) == (32, D)   # n_base = 64/2 (mirrored)
+        @test st.residuals isa AbstractArray && size(st.residuals) == (64, D)
 
         post = fit(problem, 3000; rng = MersenneTwister(0x1))
         @test post isa ScalarScaleDist
@@ -902,13 +894,11 @@ end
             # under Reactant needs compilation; the sample-moment recovery is covered on the
             # CPU path above, so here we only check the fitted mean.)
 
-            # The user can compile `step_vi!` themselves, passing `n_refine` as a
-            # `ConcreteRNumber` so one compiled graph serves any refinement count.
+            # The user can compile `step_vi!` themselves and loop the compiled thunk.
             rng2, state2 = init(MersenneTwister(0xfeed), problem)
-            nref = Reactant.ConcreteRNumber(0)
-            cstep = Reactant.@compile step_vi!(rng2, problem, state2, nref)
+            cstep = Reactant.@compile step_vi!(rng2, problem, state2)
             for _ in 1:8
-                cstep(rng2, problem, state2, nref)
+                cstep(rng2, problem, state2)
             end
             @test Array(state2.position) ≈ position_host atol = 1.0f-4 rtol = 0.0
 

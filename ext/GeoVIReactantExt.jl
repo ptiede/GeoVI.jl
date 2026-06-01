@@ -191,32 +191,26 @@ function GeoVI._wrap_rng(::ADTypes.AutoReactant, rng::AbstractRNG)
     return Reactant.ReactantRNG(Reactant.to_rarray(seed))
 end
 
-# Size the white-noise buffer under `@jit`: the tangent template runs the forward
-# model (e.g. a matmul on `ConcretePJRTArray`), which cannot execute eagerly.
-GeoVI._tangent_template(::ADTypes.AutoReactant, lh::GeoVI.AbstractLikelihood, xi) =
-    @jit(GeoVI._metric_tangent_template(lh, xi))
-
 # Drive the loop under Reactant: compile `step_vi!` ONCE for the preallocated
-# buffers (with `n_refine` as a `ConcreteRNumber` so its inner refinement loop is
-# a runtime bound — one compile serves any count), then call the compiled thunk
-# `n_iterations` times. `step_vi!` mutates the state's arrays in place, so the
-# loop just re-invokes it. Users wanting a custom loop call `@compile step_vi!`
-# themselves (the same primitive).
+# buffers, then call the compiled thunk `n_iterations` times. `step_vi!` mutates the
+# state's arrays in place, so the loop just re-invokes it. The family's `draw_samples!`
+# keeps its `randn` outside the traced loop (rng never enters `@trace`), and the metric
+# tangent template is built inside the compiled step, so the whole draw traces normally.
+# Users wanting a custom loop call `@compile step_vi!` themselves (the same primitive).
 function GeoVI._run_vi!(
         ::ADTypes.AutoReactant, rng, problem::GeoVI.VariationalProblem, state::GeoVI.VIState,
-        n_iterations, n_refine,
+        n_iterations,
     )
     # `init` always wraps the rng into a `Reactant.ReactantRNG` for an AutoReactant
     # problem, so by here `rng` is device-side and its draws advance per compiled
     # call. (A host rng would be baked in as a compile-time constant — frozen noise.)
-    nref = Reactant.ConcreteRNumber(Int(n_refine))
     @info "GeoVI: compiling step_vi!..."
     t_compile = @elapsed begin
-        cstep = @compile GeoVI.step_vi!(rng, problem, state, nref)
+        cstep = @compile GeoVI.step_vi!(rng, problem, state)
     end
     @info "GeoVI: compilation done in" t_compile
     for _ in 1:n_iterations
-        cstep(rng, problem, state, nref)
+        cstep(rng, problem, state)
     end
     return state
 end

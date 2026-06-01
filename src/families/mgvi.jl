@@ -14,7 +14,7 @@ struct MGVIFamily{S} <: AbstractVariationalFamily
 end
 MGVIFamily(; solver = ConjugateGradient()) = MGVIFamily(solver)
 
-# The frozen draw refinement (see `transform_block` in `fisher_gaussian.jl`): MGVI keeps
+# The frozen draw refinement (see `draw_samples!` in `fisher_gaussian.jl`): MGVI keeps
 # the linear CG residual as-is.
 _refine_residual(::MGVIFamily, lh, μ, linear, ms, mirrored) =
     mirrored ?

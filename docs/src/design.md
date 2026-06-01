@@ -246,14 +246,13 @@ end
 q = distribution(problem, state)  # an AbstractVariationalDistribution
 ```
 
-`step_vi!(rng, problem, state, n_refine=0)` optionally runs `n_refine` extra
-`transform!`→`update!` refinements that reuse the drawn noise (common random
-numbers — recompute the Fisher / re-curve at the moved mean).
+`step_vi!(rng, problem, state)` runs one `draw_samples!`→`update!` cycle: draw a
+Monte-Carlo set at the current mean, then optimize the variational parameters against
+that fixed set (the `draw → optimize-against-fixed-samples → resample` loop).
 
-`fit(problem, n; rng, n_refine=0)` is a convenience that runs the loop and returns
-the posterior. Under Reactant, `step_vi!` is a pure in-place mutation the user
-`@compile`s themselves and loops; `fit` does this for you (compile `step_vi!`
-once with a `ConcreteRNumber` `n_refine`, then loop the thunk).
+`fit(problem, n; rng)` is a convenience that runs the loop and returns the posterior.
+Under Reactant, `step_vi!` is a pure in-place mutation the user `@compile`s themselves
+and loops; `fit` does this for you (compile `step_vi!` once, then loop the thunk).
 
 ## Example User Flow
 

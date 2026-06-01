@@ -57,49 +57,49 @@ reparameterization `ξ = μ + σ⊙ε`).
 
 Families differ on **one axis**: where the reparameterization `T_θ` is cut into a part
 *frozen* at the current `θ` and a part *differentiated* through `θ`. That cut is the two
-hooks `transform_block` (frozen) and `transport` (differentiated):
+hooks `draw_samples!` (frozen) and `transport_and_logjac` (differentiated):
 
-- `transform_block` — the frozen prefix, run at the current `θ` and held constant,
-  producing a stored residual. Trivial (`= ε`) for pushforward families; a CG solve
-  (`MGVIFamily`) or CG + nonlinear curve (`GeoVIFamily`) for the Fisher-Gaussian families.
-  Expensive, *not* differentiated, reusable for common random numbers.
-- `transport` — the differentiated suffix, reconstructing `ξ` from `θ` + the stored
-  residual. `MGVI`/`geoVI`: `θ + r`; mean-field: `μ + σ⊙ε`; a flow: `T_θ(ε)`.
+- `draw_samples!` — the frozen prefix: fill the residual buffer with the Monte-Carlo set
+  drawn at the current `θ` and held constant during the update. IID white noise for
+  pushforward families; a CG solve (`MGVIFamily`) or CG + nonlinear curve (`GeoVIFamily`)
+  for the Fisher-Gaussian families. Expensive, *not* differentiated, redrawn each step.
+- `transport_and_logjac` — the differentiated suffix, returning `(ξ, logjac)`: the
+  reconstructed `ξ` *and* the reparameterization's log-Jacobian `log|det J|`. `MGVI`/`geoVI`:
+  `(θ + r, 0)`; mean-field: `(μ + σ⊙ε, Σ logσ)`; a flow: `(T_θ(ε), log|det J_θ|)` — one
+  forward pass yields both.
 
-Everything else *follows* from the cut: freezing the covariance ⇒ the `log q` term is `0`
-(the Fisher-Gaussian fixed-metric approximation); differentiating the shape ⇒ `log q`
-carries `-Σ logσ` / `-log|det J|`. The natural-gradient metric is the frozen covariance
-`(I+Fisher)` reused as the `NewtonCG` preconditioner — which is why `NewtonCG` is
-available for the Fisher-Gaussian families and not the pushforward ones.
+Everything else *follows* from the cut: the reverse-KL objective is
+`mean_i[-log p(ξ_i) - logjac_i]`. Freezing the covariance ⇒ `logjac = 0` (the
+Fisher-Gaussian fixed-metric approximation — the intractable metric log-det is dropped);
+differentiating the shape ⇒ `logjac` carries `Σ logσ` / `log|det J|`. The natural-gradient
+metric is the frozen covariance `(I+Fisher)` reused as the `NewtonCG` preconditioner —
+which is why `NewtonCG` is available for the Fisher-Gaussian families and not the
+pushforward ones.
 
 ### Adding a family
 
 Subtype `AbstractVariationalFamily` and implement the **required** methods:
 
 ```julia
-GeoVI.init_params(family, latent)  # the parameter container θ from the user's initial ξ₀
-GeoVI.transport(family, θ, r)        # reconstruct ξ from θ + a residual (DIFFERENTIATED through θ)
+GeoVI.init_params(family, latent)            # the parameter container θ from the user's initial ξ₀
+GeoVI.transport_and_logjac(family, θ, r)     # -> (ξ, logjac): reconstruct ξ AND its log-Jacobian
 ```
 
-`transport` defaults to `θ .+ r` (so a bare-array `θ`, like MGVI/geoVI, needs no override).
-Each **optional** hook has a default targeting the pushforward case (mean-field,
-normalizing flows), so a new pushforward family typically adds only:
-
-```julia
-GeoVI.logdensity(family, θ, ε)  # the family's log-density log q_θ(ξ); default 0 (fixed metric)
-```
+`transport_and_logjac` defaults to `(θ .+ r, 0)` (so a bare-array `θ`, like MGVI/geoVI,
+needs no override). It returns both the sample and the reparameterization's log-Jacobian
+(the family's `log q` term) so that, e.g., a normalizing flow produces `ξ` and its
+`log|det J|` from a single forward pass.
 
 A *structured* `θ` (e.g. `θ = (; mean, logstd)`) — being any Functors-compatible
 container — works with `Optimisers.setup`/`update` and the Enzyme/Reactant AD backends
-natively; such a family overrides `transport` (and, to back `rand`,
-`GeoVI.draw_noise(family, lh, θ, rng)`). A family with a non-trivial *frozen* draw
-overrides `GeoVI.transform_block(family, lh, θ, noise_i, mirrored)` and
-`GeoVI.init_noise(family, adtype, lh, latent, n)` (whose default is a single latent-shaped
-`ε` buffer; the noise bundle may be any Functors-traversable structure of arrays). To be
-usable with the `NewtonCG` optimizer, also set `GeoVI.supports_natural_gradient(family) =
-true` and implement `GeoVI.natural_gradient_metric(family, lh, θ, residuals, v)`.
+natively; such a family overrides `transport_and_logjac` (and its own distribution type's
+`rand`). A family with a non-trivial *frozen* draw overrides
+`GeoVI.draw_samples!(family, lh, θ, residuals, rng, mirrored)` (whose default fills the
+buffer with IID white noise, writing antithetic ±ε pairs when `mirrored`). To be usable
+with the `NewtonCG` optimizer, also set `GeoVI.supports_natural_gradient(family) = true`
+and implement `GeoVI.natural_gradient_metric(family, lh, θ, residuals, v)`.
 
-A complete minimal pushforward family is just the three required/optional methods above —
+A complete minimal pushforward family is just `init_params` + `transport_and_logjac` —
 no solver, no metric, no buffer plumbing.
 
 ## Estimators
@@ -199,52 +199,41 @@ end
 q = distribution(problem, state)
 ```
 
-`step_vi!(rng, problem, state, n_refine=0)` takes an optional fourth argument:
-after the fresh `sample!` → `transform!` → `update!` cycle it runs `n_refine`
-extra `transform!` → `update!` refinements that **reuse the drawn noise**
-(recompute the Fisher / re-curve at the moved mean — common random numbers).
-
-`fit(problem, n; rng, n_refine=0)` is a convenience that runs the loop and
-returns the fitted variational distribution. `VariationalProblem` resolves the AD backend
-once (e.g. inferring `AutoReactant` from a Reactant array position).
+`fit(problem, n; rng)` is a convenience that runs the loop and returns the fitted
+variational distribution. `VariationalProblem` resolves the AD backend once (e.g.
+inferring `AutoReactant` from a Reactant array position).
 
 Under Reactant, `step_vi!` is a pure in-place mutation with no host-only state,
-so you compile it yourself and loop the compiled thunk. Passing `n_refine` as a
-`ConcreteRNumber{Int}` keeps it a runtime loop bound, so one compiled graph
-serves any refinement count:
+so you compile it yourself and loop the compiled thunk:
 
 ```julia
 rng, state = init(rng, problem)        # rng is wrapped into a ReactantRNG here
-nref  = Reactant.ConcreteRNumber(k)
-cstep = Reactant.@compile step_vi!(rng, problem, state, nref)
+cstep = Reactant.@compile step_vi!(rng, problem, state)
 for _ in 1:n
-    cstep(rng, problem, state, nref)
+    cstep(rng, problem, state)
 end
 ```
 
 `fit` does exactly this for you on the Reactant path (compile once, loop the
 thunk).
 
-A VI step is the reparameterization structure of VI sliced into three phases,
-exposed as composable (unexported) primitives:
+A VI step is the `draw → optimize-against-fixed-samples → resample` loop (the same
+one NIFTy's `OptimizeVI.update` runs), sliced into two phases exposed as composable
+(unexported) primitives:
 
-- `GeoVI.sample!(rng, problem, state)` — draw white noise `ξ_w ∼ N(0, I)`. The
-  only stochastic phase.
-- `GeoVI.transform!(problem, state)` — de-whiten: apply the family transform at
-  the current mean (MGVI: CG solve; geoVI: CG + nonlinear curve) to turn the
-  stored noise into sample residuals. Re-running it (without `sample!`) recomputes
-  the Fisher/transform at the moved mean for the same realization.
-- `GeoVI.update!(problem, state)` — estimate the KL and move the variational mean.
+- `GeoVI.draw_samples!(rng, problem, state)` — fill `state.residuals` with a fresh
+  Monte-Carlo set drawn at the current mean (pushforward: IID white noise; MGVI: CG
+  solve; geoVI: CG + nonlinear curve). The only stochastic phase.
+- `GeoVI.update!(problem, state)` — estimate the KL with that fixed set and move the
+  variational parameters (one `Optimisers` step, or `NewtonCG` to convergence).
 
-`step_vi!` runs `sample!` → `transform!` → `update!`. For custom schedules — e.g.
-draw once, then refine the mean against a fixed realization (recompute-Fisher) —
-compose the phases directly:
+`step_vi!` runs `draw_samples!` → `update!`. For a custom schedule, compose the two
+phases directly:
 
 ```julia
 rng, state = init(rng, problem)
-GeoVI.sample!(rng, problem, state)
-for _ in 1:k
-    GeoVI.transform!(problem, state)   # recompute the Fisher at the moved mean
+for _ in 1:n
+    GeoVI.draw_samples!(rng, problem, state)
     GeoVI.update!(problem, state)
 end
 ```
