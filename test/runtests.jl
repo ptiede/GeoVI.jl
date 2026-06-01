@@ -839,11 +839,11 @@ end
         )   # no solver, no metric — the default `draw_samples!` supplies white noise.
 
         # Init allocates the latent-shaped residual buffer (white noise; no metric tangent).
-        rng_i, st = init(MersenneTwister(0x1), problem)
+        rng_i, st = init(MersenneTwister(0x01), problem)
         @test st.position isa NamedTuple && keys(st.position) == (:mean, :logs)
         @test st.residuals isa AbstractArray && size(st.residuals) == (64, D)
 
-        post = fit(problem, 3000; rng = MersenneTwister(0x1))
+        post = fit(problem, 3000; rng = MersenneTwister(0x01))
         @test post isa ScalarScaleDist
         @test post.mean ≈ setup.μ_post atol = 0.05 rtol = 0.0
         # draw fresh samples from the fitted custom distribution

@@ -1,9 +1,9 @@
-struct BernoulliLikelihood{D,W} <: AbstractLikelihood
+struct BernoulliLikelihood{D, W} <: AbstractLikelihood
     data::D
     weight::W
 end
 
-function BernoulliLikelihood(data; weight=1)
+function BernoulliLikelihood(data; weight = 1)
     _validate_binary_data(data)
     _validate_nonnegative("weight", weight)
     return BernoulliLikelihood(data, weight)

@@ -1,4 +1,4 @@
-struct ComposedLikelihood{L,F,LIN,AD,AO} <: AbstractLikelihood
+struct ComposedLikelihood{L, F, LIN, AD, AO} <: AbstractLikelihood
     likelihood::L
     forward::F
     linearize::LIN
@@ -7,14 +7,14 @@ struct ComposedLikelihood{L,F,LIN,AD,AO} <: AbstractLikelihood
 end
 
 function ComposedLikelihood(
-    likelihood::AbstractLikelihood,
-    forward;
-    linearize=nothing,
-    pushforward=nothing,
-    pullback=nothing,
-    adtype=ADTypes.AutoFiniteDiff(),
-    autodiff_options=(;),
-)
+        likelihood::AbstractLikelihood,
+        forward;
+        linearize = nothing,
+        pushforward = nothing,
+        pullback = nothing,
+        adtype = ADTypes.AutoFiniteDiff(),
+        autodiff_options = (;),
+    )
     if linearize !== nothing && (pushforward !== nothing || pullback !== nothing)
         throw(
             ArgumentError(
@@ -35,22 +35,22 @@ function ComposedLikelihood(
 end
 
 function compose(
-    lh::AbstractLikelihood,
-    forward;
-    linearize=nothing,
-    pushforward=nothing,
-    pullback=nothing,
-    adtype=ADTypes.AutoFiniteDiff(),
-    autodiff_options=(;),
-)
+        lh::AbstractLikelihood,
+        forward;
+        linearize = nothing,
+        pushforward = nothing,
+        pullback = nothing,
+        adtype = ADTypes.AutoFiniteDiff(),
+        autodiff_options = (;),
+    )
     return ComposedLikelihood(
         lh,
         forward;
-        linearize=linearize,
-        pushforward=pushforward,
-        pullback=pullback,
-        adtype=adtype,
-        autodiff_options=autodiff_options,
+        linearize = linearize,
+        pushforward = pushforward,
+        pullback = pullback,
+        adtype = adtype,
+        autodiff_options = autodiff_options,
     )
 end
 

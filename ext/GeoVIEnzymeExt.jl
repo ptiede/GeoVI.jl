@@ -9,7 +9,7 @@ function _forward_to!(y, x, forward)
     return nothing
 end
 
-struct _EnzymeLinearization{F,X,V}
+struct _EnzymeLinearization{F, X, V}
     forward::F
     x::X
     value::V
@@ -40,20 +40,20 @@ function GeoVI.pullback(lin::_EnzymeLinearization, η::AbstractArray)
 end
 
 function GeoVI._automatic_linearize(
-    ::AutoEnzyme,
-    forward,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
+        ::AutoEnzyme,
+        forward,
+        x::AbstractArray;
+        fd_eps::Real = 1.0e-6,
+    )
     return _EnzymeLinearization(forward, x, forward(x))
 end
 
 function GeoVI._value_and_gradient(
-    ::AutoEnzyme,
-    objective,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
+        ::AutoEnzyme,
+        objective,
+        x::AbstractArray;
+        fd_eps::Real = 1.0e-6,
+    )
     result = Enzyme.gradient(Enzyme.ReverseWithPrimal, objective, x)
     return result.val, result.derivs[1]
 end
