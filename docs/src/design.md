@@ -157,11 +157,11 @@ recenter(samples::Samples, new_position)
 
 Notes:
 
-- `position` is the expansion point / latent mean
-- `residuals` are stored relative to `position`
+- `position` is the expansion point / latent mean, or `nothing` (the fitted posterior stores `position = nothing` and `residuals` = the full reconstructed `ξ` samples)
+- `residuals` are stored relative to `position` (or are the samples themselves when `position === nothing`)
 - `keys` holds RNG seeds or sampler state, when relevant
-- `posterior_samples(samples)` should return `position .+ residuals`
-- both `position` and `residuals` are dense arrays in the current design
+- `posterior_samples(samples)` returns `position .+ residuals`, or just `residuals` when `position === nothing`
+- `position` and `residuals` are dense arrays (or `position` is `nothing`)
 
 ### Four orthogonal axes
 
@@ -243,7 +243,7 @@ rng, state = init(rng, problem)   # state: one mutable, fully preallocated VISta
 for _ in 1:n
     step_vi!(rng, problem, state) # mutates state and its buffers in place
 end
-post = posterior(problem, state)  # a VariationalPosterior
+q = distribution(problem, state)  # an AbstractVariationalDistribution
 ```
 
 `step_vi!(rng, problem, state, n_refine=0)` optionally runs `n_refine` extra
@@ -280,9 +280,9 @@ problem = VariationalProblem(
     adtype    = ADTypes.AutoEnzyme(),
 )
 
-post  = fit(problem, 8; rng)        # returns a VariationalPosterior
-draws = rand(rng, post, 100)        # draw arbitrarily many new samples
-μ     = mean(post)                  # the latent mean
+q     = fit(problem, 8; rng)        # returns the fitted variational distribution
+draws = rand(rng, q, 100)           # draw arbitrarily many new samples
+μ     = q.mean                      # the latent mean
 ```
 
 This remains valid whether the differentiation engine is finite differences,

@@ -38,27 +38,69 @@ Notes:
 
 ## Variational Families
 
-A variational family defines *how a sample is drawn from the variational
-distribution* `q`, and carries the solvers that draw needs (but no
-outer-optimization or Monte-Carlo-budget knobs):
+A variational family is the distribution `q_θ`. VI minimizes the reverse KL
+
+```
+J(θ) = mean_i[ -log p(ξ_i) + log q_θ(ξ_i) ],   ξ_i = T_θ(η_i),  η_i ∼ N(0, I).
+```
 
 ```julia
 abstract type AbstractVariationalFamily end
 ```
 
-The built-in families are `MGVIFamily(; solver=ConjugateGradient(...))` and
-`GeoVIFamily(; solver=ConjugateGradient(...), curve=NewtonCG(...))`.
+The built-in families are `MGVIFamily(; solver=ConjugateGradient(...))`,
+`GeoVIFamily(; solver=ConjugateGradient(...), curve=NewtonCG(...))`, and
+`MeanFieldGaussian()` (mean-field ADVI — a diagonal Gaussian `N(μ, diag σ²)` with the
+reparameterization `ξ = μ + σ⊙ε`).
 
-To add a new family, subtype `AbstractVariationalFamily` and implement
+### The frozen prefix / differentiated suffix split
+
+Families differ on **one axis**: where the reparameterization `T_θ` is cut into a part
+*frozen* at the current `θ` and a part *differentiated* through `θ`. That cut is the two
+hooks `transform_block` (frozen) and `transport` (differentiated):
+
+- `transform_block` — the frozen prefix, run at the current `θ` and held constant,
+  producing a stored residual. Trivial (`= ε`) for pushforward families; a CG solve
+  (`MGVIFamily`) or CG + nonlinear curve (`GeoVIFamily`) for the Fisher-Gaussian families.
+  Expensive, *not* differentiated, reusable for common random numbers.
+- `transport` — the differentiated suffix, reconstructing `ξ` from `θ` + the stored
+  residual. `MGVI`/`geoVI`: `θ + r`; mean-field: `μ + σ⊙ε`; a flow: `T_θ(ε)`.
+
+Everything else *follows* from the cut: freezing the covariance ⇒ the `log q` term is `0`
+(the Fisher-Gaussian fixed-metric approximation); differentiating the shape ⇒ `log q`
+carries `-Σ logσ` / `-log|det J|`. The natural-gradient metric is the frozen covariance
+`(I+Fisher)` reused as the `NewtonCG` preconditioner — which is why `NewtonCG` is
+available for the Fisher-Gaussian families and not the pushforward ones.
+
+### Adding a family
+
+Subtype `AbstractVariationalFamily` and implement the **required** methods:
 
 ```julia
-_draw_sample_block(family::YourFamily, lh, position, rng, mirrored)
-_draw_one_residual(family::YourFamily, lh, position, rng)
+GeoVI.init_params(family, latent)  # the parameter container θ from the user's initial ξ₀
+GeoVI.transport(family, θ, r)        # reconstruct ξ from θ + a residual (DIFFERENTIATED through θ)
 ```
 
-The first returns a (possibly mirrored) sample block plus auxiliary sampler
-info and is used during fitting; the second returns a single residual and backs
-`rand` on a `VariationalPosterior`. Both consume the family's own stored solvers.
+`transport` defaults to `θ .+ r` (so a bare-array `θ`, like MGVI/geoVI, needs no override).
+Each **optional** hook has a default targeting the pushforward case (mean-field,
+normalizing flows), so a new pushforward family typically adds only:
+
+```julia
+GeoVI.logdensity(family, θ, ε)  # the family's log-density log q_θ(ξ); default 0 (fixed metric)
+```
+
+A *structured* `θ` (e.g. `θ = (; mean, logstd)`) — being any Functors-compatible
+container — works with `Optimisers.setup`/`update` and the Enzyme/Reactant AD backends
+natively; such a family overrides `transport` (and, to back `rand`,
+`GeoVI.draw_noise(family, lh, θ, rng)`). A family with a non-trivial *frozen* draw
+overrides `GeoVI.transform_block(family, lh, θ, noise_i, mirrored)` and
+`GeoVI.init_noise(family, adtype, lh, latent, n)` (whose default is a single latent-shaped
+`ε` buffer; the noise bundle may be any Functors-traversable structure of arrays). To be
+usable with the `NewtonCG` optimizer, also set `GeoVI.supports_natural_gradient(family) =
+true` and implement `GeoVI.natural_gradient_metric(family, lh, θ, residuals, v)`.
+
+A complete minimal pushforward family is just the three required/optional methods above —
+no solver, no metric, no buffer plumbing.
 
 ## Estimators
 
@@ -81,18 +123,18 @@ The current divergence surface is:
 abstract type AbstractFDivergence end
 ```
 
-To add a new divergence, subtype `AbstractFDivergence` and implement, dispatching
-**jointly on the family and the divergence**:
+To add a new divergence, subtype `AbstractFDivergence` and implement the scalar objective
+minimized by `fit`, dispatching **jointly on the family and the divergence**:
 
 ```julia
 _fdivergence_value(family, ::YourDivergence, lh, position, residuals)
-_fdivergence_fishermetric(family, ::YourDivergence, lh, position, residuals, v)
 ```
 
-The first method provides the scalar objective minimized by `fit`, and the
-second provides the associated Fisher-metric action used by second-order
-optimizers. The joint `family × divergence` dispatch lets a scheme ship its own
-objective.
+The joint `family × divergence` dispatch lets a scheme ship its own objective form. The
+natural-gradient metric used by second-order optimizers is *not* part of the divergence
+surface — it is an optimizer concern carried by the family
+(`GeoVI.natural_gradient_metric`, consulted only by `NewtonCG`); see *Variational
+Families* above.
 
 ## Optimizers
 
@@ -154,7 +196,7 @@ rng, state = init(rng, problem)        # state: one mutable, fully preallocated 
 for _ in 1:n
     step_vi!(rng, problem, state)      # mutates state and its buffers in place
 end
-post = posterior(problem, state)
+q = distribution(problem, state)
 ```
 
 `step_vi!(rng, problem, state, n_refine=0)` takes an optional fourth argument:
@@ -163,7 +205,7 @@ extra `transform!` → `update!` refinements that **reuse the drawn noise**
 (recompute the Fisher / re-curve at the moved mean — common random numbers).
 
 `fit(problem, n; rng, n_refine=0)` is a convenience that runs the loop and
-returns the `VariationalPosterior`. `VariationalProblem` resolves the AD backend
+returns the fitted variational distribution. `VariationalProblem` resolves the AD backend
 once (e.g. inferring `AutoReactant` from a Reactant array position).
 
 Under Reactant, `step_vi!` is a pure in-place mutation with no host-only state,

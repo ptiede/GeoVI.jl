@@ -161,7 +161,7 @@ end
 
 function _check_optimizer_step(new_x, step_size)
     valid = false
-    @trace if all(isfinite, new_x) & isfinite(step_size)
+    @trace if _param_all_finite(new_x) & isfinite(step_size)
         valid = true
     end
     return valid
@@ -183,15 +183,14 @@ function _evaluate_optimizer_candidate(
         objective_evaluations,
         fun_and_grad,
     )
-    new_value = value
-    new_grad = grad
-    value_valid = false
-    evaluations = objective_evaluations
-    @trace if step_valid
-        new_value, new_grad = fun_and_grad(new_x)
-        evaluations += 1
-        value_valid = _check_objective_value(new_value)
-    end
+    # Evaluate the candidate UNCONDITIONALLY. Guarding `fun_and_grad` (an Enzyme
+    # autodiff) behind `@trace if step_valid` makes XLA compilation of the enclosing
+    # `@trace while` fail with `operand #N does not dominate this use` (a Reactant
+    # bug). A non-finite candidate from a bad step just yields `value_valid = false`
+    # and is discarded downstream.
+    new_value, new_grad = fun_and_grad(new_x)
+    evaluations = objective_evaluations + 1
+    value_valid = step_valid & _check_objective_value(new_value)
     return new_value, new_grad, value_valid, evaluations
 end
 
@@ -301,8 +300,11 @@ function _run_optimizer_rule(
 
     @trace track_numbers = false while keep_going & (iteration < maxiter)
         state, new_x = _optimizer_update(state, x, grad)
-        delta = new_x .- x
-        step_size = stepnorm(delta)
+        # Tree-generic so θ may be a bare array (MGVI/geoVI) or a structured
+        # container (mean-field's NamedTuple); reduces to `new_x .- x` / `norm`
+        # for an array.
+        delta = _param_sub(new_x, x)
+        step_size = _param_norm(delta)
         step_valid = _check_optimizer_step(new_x, step_size)
         new_value, new_grad, value_valid, objective_evaluations = evaluate_candidate(
             step_valid,
@@ -597,7 +599,7 @@ end
 
 function _optimize(
         optimizer::Optimisers.AbstractRule,
-        x0::AbstractArray;
+        x0;
         fun_and_grad,
         metricp = nothing,
         maxiter::Integer = 20,

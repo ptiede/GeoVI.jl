@@ -11,6 +11,9 @@ using Optimisers
 using Random
 using Statistics: mean
 
+# The fitted output is an `AbstractVariationalDistribution`; its center is `.mean`.
+_post_mean(q) = q.mean
+
 function _linear_gaussian_setup(rng; D = 100, M = 50, σ² = 0.25)
     A = randn(rng, M, D) ./ sqrt(D)
     ξ_true = randn(rng, D)
@@ -517,21 +520,20 @@ end
         rng_step, step_state = init(MersenneTwister(5), mgvi_problem)
         step_vi!(rng_step, mgvi_problem, step_state)
         @test size(step_state.residuals, 1) == 8
-        @test length(posterior(mgvi_problem, step_state).samples.keys) == 4
+        @test distribution(mgvi_problem, step_state) isa FisherGaussianDistribution
 
-        # fit returns a VariationalPosterior
+        # fit returns the fitted variational distribution
         mgvi_post = fit(mgvi_problem, 3; rng = MersenneTwister(5))
-        @test mgvi_post isa VariationalPosterior
-        @test mean(mgvi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
-        @test length(mgvi_post.samples) == 8
-        @test size(posterior_samples(mgvi_post.samples)) == (8, 1)
+        @test mgvi_post isa AbstractVariationalDistribution
+        @test _post_mean(mgvi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
+        @test size(rand(MersenneTwister(7), mgvi_post, 8)) == (8, 1)   # draw fresh samples
 
         # the explicit loop reuses one VIState and matches fit bit-for-bit
         rng, state = init(MersenneTwister(5), mgvi_problem)
         for _ in 1:3
             step_vi!(rng, mgvi_problem, state)
         end
-        @test mean(posterior(mgvi_problem, state)) ≈ mean(mgvi_post) atol = 1.0e-12 rtol = 1.0e-12
+        @test _post_mean(distribution(mgvi_problem, state)) ≈ _post_mean(mgvi_post) atol = 1.0e-12 rtol = 1.0e-12
 
         # rand draws arbitrary new samples from the fitted distribution
         draws = rand(MersenneTwister(7), mgvi_post, 64)
@@ -554,7 +556,7 @@ end
         step_vi!(rng_g, geovi_problem, geovi_state)
         @test geovi_problem.family isa GeoVIFamily
         geovi_post = fit(geovi_problem, 3; rng = MersenneTwister(5))
-        @test mean(geovi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
+        @test _post_mean(geovi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
 
         # A bare Optimisers rule is the outer optimizer: each step_vi! takes one
         # gradient step, and the user owns the iteration count. With no samples
@@ -568,7 +570,7 @@ end
             optimizer = Optimisers.Adam(0.05),
         )
         adam_post = fit(adam_problem, 400; rng = MersenneTwister(11))
-        @test mean(adam_post) ≈ analytic_mean atol = 1.0e-2 rtol = 0.0
+        @test _post_mean(adam_post) ≈ analytic_mean atol = 1.0e-2 rtol = 0.0
 
         # Adam optimizer state persists across steps: two steps (carrying
         # momentum) differ from a fresh single step at the same position.
@@ -611,8 +613,8 @@ end
         # White-noise buffers preallocated at init (one row per base draw).
         mgvi = VariationalProblem(lh, zeros(D); family = MGVIFamily(solver = solver), estimator = est, optimizer = outer)
         _, st = init(MersenneTwister(1), mgvi)
-        @test size(st.metric_white) == (16, M)   # n_base = 32 / 2 (mirrored)
-        @test size(st.prior_white) == (16, D)
+        @test size(st.noise.metric) == (16, M)   # n_base = 32 / 2 (mirrored)
+        @test size(st.noise.prior) == (16, D)
 
         geovi = VariationalProblem(
             lh, zeros(D);
@@ -641,11 +643,11 @@ end
             GeoVI.transform!(geovi, s2)
             GeoVI.update!(geovi, s2)
         end
-        @test mean(posterior(geovi, s2)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
+        @test _post_mean(distribution(geovi, s2)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
 
         # `step_vi!` (a fresh sample!+transform!+update! per call) also converges.
         post = fit(geovi, 8; rng = MersenneTwister(9))
-        @test mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
+        @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
     end
 
     @testset "linear-Gaussian conjugate end-to-end" begin
@@ -675,15 +677,7 @@ end
                 optimizer = outer,
             )
             post = fit(problem, 8; rng = MersenneTwister(2025))
-            @test mean(post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
-
-            draws = posterior_samples(post.samples)
-            @test size(draws) == (n_samples, D)
-            @test vec(mean(draws; dims = 1)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
-
-            centered = draws .- mean(draws; dims = 1)
-            tr_emp = sum(abs2, centered) / n_samples
-            @test tr_emp ≈ tr(setup.Σ_post) rtol = 0.25
+            @test _post_mean(post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
 
             # `rand` from the fitted distribution recovers the posterior moments.
             # Independent (non-mirrored) draws carry Monte-Carlo noise, so the
@@ -692,7 +686,7 @@ end
             n_rand = 512
             rdraws = rand(MersenneTwister(99), post, n_rand)
             mc_err = sqrt(tr(setup.Σ_post) / n_rand)
-            @test norm(vec(mean(rdraws; dims = 1)) .- mean(post)) < 4 * mc_err
+            @test norm(vec(mean(rdraws; dims = 1)) .- _post_mean(post)) < 4 * mc_err
             rcentered = rdraws .- mean(rdraws; dims = 1)
             @test sum(abs2, rcentered) / n_rand ≈ tr(setup.Σ_post) rtol = 0.3
         end
@@ -714,7 +708,7 @@ end
             optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, absdelta = ad, cg_rtol = 1.0e-10, cg_maxiter = 200),
         )
         coupled_post = fit(coupled_problem, 8; rng = MersenneTwister(2025))
-        @test mean(coupled_post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
+        @test _post_mean(coupled_post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
 
         # The `delta` convenience (per-d.o.f. tolerance) must be exactly
         # equivalent to `absdelta = delta·length(x0)`.
@@ -732,7 +726,137 @@ end
             optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, delta = delta, cg_rtol = 1.0e-10, cg_maxiter = 200),
         )
         delta_post = fit(delta_problem, 8; rng = MersenneTwister(2025))
-        @test mean(delta_post) ≈ mean(coupled_post) atol = 1.0e-12 rtol = 1.0e-12
+        @test _post_mean(delta_post) ≈ _post_mean(coupled_post) atol = 1.0e-12 rtol = 1.0e-12
+    end
+
+    @testset "θ-container generalization + MeanFieldGaussian ADVI" begin
+        # ── interface defaults: for MGVI/geoVI θ *is* the latent point ──
+        xi = [0.3, -0.7, 1.2]
+        r = [0.1, 0.2, -0.1]
+        @test GeoVI.transport(MGVIFamily(), xi, r) == r .+ xi          # default transport: θ .+ residual
+        @test GeoVI.logdensity(MGVIFamily(), xi, r) == false  # fixed-metric: no log q term
+        ip = GeoVI.init_params(MGVIFamily(), xi)
+        @test ip == xi && ip !== xi   # a fresh copy
+
+        # ── tree-generic optimizer helpers reduce to the array ops ──
+        a = [1.0, 2.0, 3.0]
+        b = [0.5, 1.0, 0.5]
+        @test GeoVI._param_sub(a, b) == a .- b
+        @test GeoVI._param_norm(a) ≈ norm(a)
+        @test GeoVI._param_all_finite(a)
+        @test !GeoVI._param_all_finite([1.0, Inf])
+        θa = (; mean = a, logstd = b)
+        θb = (; mean = b, logstd = a)
+        d = GeoVI._param_sub(θa, θb)
+        @test d.mean == a .- b && d.logstd == b .- a
+        @test GeoVI._param_norm(θa) ≈ sqrt(norm(a)^2 + norm(b)^2)
+        @test GeoVI._param_all_finite(θa)
+        @test !GeoVI._param_all_finite((; mean = a, logstd = [Inf, 0.0, 0.0]))
+
+        # ── mean-field ADVI recovers the linear-Gaussian closed form ──
+        rng = MersenneTwister(0x9b16)
+        D, M = 24, 14
+        setup = _linear_gaussian_setup(rng; D = D, M = M, σ² = 0.25)
+        lh = compose(GaussianLikelihood(setup.data; precision = setup.precision), ξ -> setup.A * ξ)
+        xi0 = zeros(D)
+
+        mf = VariationalProblem(
+            lh, xi0;
+            family = MeanFieldGaussian(),
+            divergence = ReverseKL(),
+            estimator = MCEstimator(n_samples = 128, mirrored = true),
+            optimizer = Optimisers.Adam(0.05),
+        )
+        # θ is the structured `(; mean, logstd)` NamedTuple; no metric-tangent noise.
+        rng_i, st = init(MersenneTwister(0xfeed), mf)
+        @test st.position isa NamedTuple
+        @test keys(st.position) == (:mean, :logstd)
+        # mean-field: the default noise bundle is a single latent ε buffer (no metric noise).
+        @test st.noise isa AbstractArray
+        @test size(st.noise) == (64, D)          # n_base = 128 / 2 (mirrored)
+
+        post = fit(mf, 3000; rng = MersenneTwister(0xfeed))
+        # Mean-field recovers the exact posterior mean; its marginal σ is the
+        # inverse-sqrt of the posterior PRECISION diagonal (it underestimates the
+        # true marginal variance — a known property of mean-field).
+        σ_expected = 1 ./ sqrt.(diag(I + setup.A' * Diagonal(setup.precision) * setup.A))
+        @test post isa DiagonalGaussian
+        @test _post_mean(post) isa AbstractVector       # the latent mean
+        @test _post_mean(post) ≈ setup.μ_post atol = 0.05 rtol = 0.0
+        @test exp.(post.logstd) ≈ σ_expected rtol = 0.15
+
+        # draw fresh samples from the fitted diagonal Gaussian → recovers the marginal σ
+        rdraws = rand(MersenneTwister(3), post, 4000)
+        @test size(rdraws) == (4000, D)
+        emp_var = vec(sum(abs2, rdraws .- mean(rdraws; dims = 1); dims = 1)) ./ 4000
+        @test emp_var ≈ σ_expected .^ 2 rtol = 0.2
+
+        # ── a NamedTuple-θ `step_vi!` moves BOTH leaves and threads the state ──
+        rng_s, s = init(MersenneTwister(123), mf)
+        mean0 = copy(s.position.mean)
+        logstd0 = copy(s.position.logstd)
+        step_vi!(rng_s, mf, s)
+        @test s.position.mean != mean0
+        @test s.position.logstd != logstd0
+        @test s.optimizer_state !== nothing
+
+        # ── guards: mean-field needs an Optimisers rule and n_samples > 0 ──
+        @test_throws ArgumentError VariationalProblem(
+            lh, xi0; family = MeanFieldGaussian(), optimizer = NewtonCG()
+        )
+        @test_throws ArgumentError VariationalProblem(
+            lh, xi0; family = MeanFieldGaussian(),
+            estimator = MCEstimator(n_samples = 0), optimizer = Optimisers.Adam(0.05),
+        )
+    end
+
+    @testset "custom pushforward family (minimal interface)" begin
+        # A brand-new family that is NOT one of the built-ins, implementing ONLY the
+        # general pushforward surface — `init_params` + `transport` + `logdensity` — and no
+        # Fisher-Gaussian / metric machinery. It is a diagonal Gaussian with a single
+        # *shared* scalar log-scale (distinct from mean-field's per-coordinate σ), which
+        # exercises a structured θ reconstructed through `transport`. Proving it runs through
+        # `fit` with a bare `Optimisers.jl` rule is the point of the refactor.
+        struct ScalarScaleGaussian <: GeoVI.AbstractVariationalFamily end
+        GeoVI.init_params(::ScalarScaleGaussian, x) =
+            (; mean = copy(x), logs = fill(zero(eltype(x)), 1))
+        GeoVI.transport(::ScalarScaleGaussian, θ, ε) = θ.mean .+ exp(θ.logs[1]) .* ε
+        # log q_θ(ξ) for q = N(μ, σ²I), σ = exp(logs), ξ = μ + σ⊙ε: `-½‖ε‖² - D·logs` (the
+        # θ-gradient comes from `-D·logs`; `-½‖ε‖²` is the per-sample part the genuine
+        # density carries, up to the dropped global constant).
+        GeoVI.logdensity(::ScalarScaleGaussian, θ, ε) = -length(θ.mean) * θ.logs[1] - sum(abs2, ε) / 2
+        # the fitted distribution (the first-class output) is the family's own type:
+        struct ScalarScaleDist{V, T} <: GeoVI.AbstractVariationalDistribution
+            mean::V
+            logscale::T
+        end
+        GeoVI.distribution(::ScalarScaleGaussian, θ, lh) = ScalarScaleDist(θ.mean, θ.logs[1])
+        Base.rand(rng::AbstractRNG, d::ScalarScaleDist) =
+            d.mean .+ exp(d.logscale) .* randn_like(rng, d.mean)
+
+        rng = MersenneTwister(0x515c)
+        D, M = 20, 12
+        setup = _linear_gaussian_setup(rng; D = D, M = M, σ² = 0.25)
+        lh = compose(GaussianLikelihood(setup.data; precision = setup.precision), ξ -> setup.A * ξ)
+
+        problem = VariationalProblem(
+            lh, zeros(D);
+            family = ScalarScaleGaussian(),
+            estimator = MCEstimator(n_samples = 64, mirrored = true),
+            optimizer = Optimisers.Adam(0.05),
+        )   # no solver, no metric — defaults supply transform_block/init_noise.
+
+        # Init uses the default single-latent-buffer noise (no metric tangent), sized from ξ₀.
+        rng_i, st = init(MersenneTwister(0x1), problem)
+        @test st.position isa NamedTuple && keys(st.position) == (:mean, :logs)
+        @test st.noise isa AbstractArray && size(st.noise) == (32, D)   # n_base = 64/2 (mirrored)
+
+        post = fit(problem, 3000; rng = MersenneTwister(0x1))
+        @test post isa ScalarScaleDist
+        @test post.mean ≈ setup.μ_post atol = 0.05 rtol = 0.0
+        # draw fresh samples from the fitted custom distribution
+        draws = rand(MersenneTwister(5), post, 64)
+        @test size(draws) == (64, D)
     end
 
     @testset "Reactant extension" begin
@@ -771,16 +895,12 @@ end
             # `fit` compiles `step_vi!` once (via `_run_vi!(::AutoReactant,...)`)
             # and loops the compiled thunk.
             post = fit(problem, 8; rng = MersenneTwister(0xfeed))
-            position_host = Array(mean(post))
+            @test post isa FisherGaussianDistribution
+            position_host = Array(_post_mean(post))
             @test position_host ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
-
-            draws_host = Array(posterior_samples(post.samples))
-            @test size(draws_host) == (n_samples, D)
-            @test vec(mean(draws_host; dims = 1)) ≈ Float32.(setup.μ_post) atol = 0.25 rtol = 0.0
-
-            centered = draws_host .- mean(draws_host; dims = 1)
-            tr_emp = sum(abs2, centered) / n_samples
-            @test tr_emp ≈ tr(setup.Σ_post) rtol = 0.35
+            # (drawing fresh MGVI samples from the fitted distribution is a CG solve, which
+            # under Reactant needs compilation; the sample-moment recovery is covered on the
+            # CPU path above, so here we only check the fitted mean.)
 
             # The user can compile `step_vi!` themselves, passing `n_refine` as a
             # `ConcreteRNumber` so one compiled graph serves any refinement count.
@@ -791,6 +911,32 @@ end
                 cstep(rng2, problem, state2, nref)
             end
             @test Array(state2.position) ≈ position_host atol = 1.0f-4 rtol = 0.0
+
+            # ── mean-field ADVI under Reactant ──
+            # The generic NamedTuple θ `(; mean, logstd)` is allocated and wrapped
+            # at `init`, `@compile step_vi!` traces it, and the rule-optimizer loop
+            # (`_run_optimizer_rule`) compiles now that its body is branchless
+            # (`_select_pick`/`_select_scalar`, like the NewtonCG loop) rather than
+            # rebinding the carried iterate inside `@trace if`. Both leaves of θ
+            # must advance and recover the posterior moments.
+            xi0_mf = Reactant.to_rarray(zeros(Float32, D))
+            mf_problem = VariationalProblem(
+                lh, xi0_mf;
+                family = MeanFieldGaussian(),
+                divergence = ReverseKL(),
+                estimator = MCEstimator(n_samples = n_samples, mirrored = true),
+                optimizer = Optimisers.Adam(0.05),
+                adtype = GeoVI.ADTypes.AutoEnzyme(),
+            )
+            rng_mf, state_mf = init(MersenneTwister(0xabcd), mf_problem)
+            @test state_mf.position isa NamedTuple   # generic θ container under Reactant
+            @test keys(state_mf.position) == (:mean, :logstd)
+
+            mf_post = fit(mf_problem, 3000; rng = MersenneTwister(0xabcd))
+            σ_expected = 1 ./ sqrt.(diag(I + setup.A' * Diagonal(setup.precision) * setup.A))
+            @test mf_post isa DiagonalGaussian
+            @test Array(_post_mean(mf_post)) ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
+            @test Array(exp.(mf_post.logstd)) ≈ Float32.(σ_expected) rtol = 0.35
         end
     end
 end

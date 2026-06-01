@@ -17,48 +17,74 @@ const _ReactantArray = Union{Reactant.ConcreteRArray, Reactant.TracedRArray}
 # Int/Float64/Bool fields as compile-time constants, and the hot loops use
 # `@trace ... track_numbers=false` so the deep number-walk is suppressed there.
 
-struct ReactantOptimizerState{R, S}
+# A frozen-flag-free image of an Optimisers `Leaf` so Reactant does not trace the
+# `frozen::Bool`. An optimizer-state *tree* (a single `Leaf` for a bare-array θ, or
+# a NamedTuple/Tuple of `Leaf`s for a structured θ such as mean-field's
+# `(; mean, logstd)`) is mapped leaf-wise to the same structure of `ReactantLeaf`s.
+struct ReactantLeaf{R, S}
     rule::R
     state::S
 end
 
-_optimizer_leaf(state::ReactantOptimizerState) = Optimisers.Leaf(state.rule, state.state, false)
-
-function _reactant_optimizer_state(state::Optimisers.Leaf)
-    return ReactantOptimizerState(state.rule, state.state)
+struct ReactantOptimizerState{T}
+    tree::T
 end
 
-function _reactant_optimizer_state(state::ReactantOptimizerState)
-    return state
-end
+# Optimisers state tree → ReactantOptimizerState (strip the per-leaf frozen flag).
+_to_reactant_state(state::ReactantOptimizerState) = state
+_to_reactant_state(state) = ReactantOptimizerState(
+    GeoVI.fmap(l -> ReactantLeaf(l.rule, l.state), state; exclude = x -> x isa Optimisers.Leaf),
+)
+# ReactantOptimizerState → Optimisers state tree (rebuild `Leaf`s, frozen = false).
+_from_reactant_state(s::ReactantOptimizerState) = GeoVI.fmap(
+    rl -> Optimisers.Leaf(rl.rule, rl.state, false), s.tree; exclude = x -> x isa ReactantLeaf,
+)
 
+# True if `x` (or any of its leaves) is a Reactant array.
+_any_reactant(x::_ReactantArray) = true
+_any_reactant(x::AbstractArray) = false
+_any_reactant(x) = any(_any_reactant, Optimisers.trainables(x))
+
+# Build (and wrap) the optimizer state at `init` for a Reactant θ, so the value
+# stored in the `VIState` — and thus the `@compile step_vi!` argument — is already
+# frozen-stripped. Covers a bare-array θ and a structured (NamedTuple/Tuple) θ
+# whose leaves are Reactant arrays; defers to the generic (eager) path otherwise.
 function GeoVI._optimizer_state(
         optimizer::Optimisers.AbstractRule,
-        x0,
-        previous_state::ReactantOptimizerState,
+        x0::Union{_ReactantArray, NamedTuple, Tuple},
+        previous_state,
     )
-    return previous_state
+    previous_state isa ReactantOptimizerState && return previous_state
+    _any_reactant(x0) || return invoke(
+        GeoVI._optimizer_state,
+        Tuple{Optimisers.AbstractRule, Any, Any},
+        optimizer, x0, previous_state,
+    )
+    if previous_state isa GeoVI.OptimizationResult &&
+            previous_state.optimizer == optimizer &&
+            previous_state.optimizer_state !== nothing
+        return previous_state.optimizer_state
+    end
+    return _to_reactant_state(@jit(Optimisers.setup(optimizer, x0)))
 end
 
-function GeoVI._prepare_optimizer_state(
-        optimizer::Optimisers.AbstractRule,
-        x0::_ReactantArray,
-        optimizer_state,
-    )
-    if isnothing(optimizer_state)
-        return _reactant_optimizer_state(@jit(Optimisers.setup(optimizer, x0)))
-    end
-    return _reactant_optimizer_state(optimizer_state)
-end
+# Inside the compiled `_optimize`, `init` has already produced the wrapped state
+# (via `_optimizer_state` below), so this is a pure type-dispatch pass-through with
+# no runtime branching — branching on a traced value here is a tracing error.
+GeoVI._prepare_optimizer_state(
+    optimizer::Optimisers.AbstractRule,
+    x0,
+    optimizer_state::ReactantOptimizerState,
+) = optimizer_state
 
 function GeoVI._optimizer_update(
         state::ReactantOptimizerState,
         x,
         grad,
     )
-    leaf_state = _optimizer_leaf(state)
-    leaf_state, new_x = Optimisers.update(leaf_state, x, grad)
-    return _reactant_optimizer_state(leaf_state), new_x
+    opt_tree = _from_reactant_state(state)
+    new_tree, new_x = Optimisers.update(opt_tree, x, grad)
+    return _to_reactant_state(new_tree), new_x
 end
 
 GeoVI._runtime_failure_enabled(::_ReactantArray) = !Reactant.within_compile()
@@ -152,7 +178,7 @@ end
 function GeoVI._value_and_gradient(
         ::ADTypes.AutoReactant,
         objective,
-        x::AbstractArray;
+        x;
         fd_eps = 1.0e-6,
     )
     result = Reactant.Enzyme.gradient(Reactant.Enzyme.ReverseWithPrimal, objective, x)

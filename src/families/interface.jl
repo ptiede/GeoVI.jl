@@ -1,0 +1,174 @@
+# ════════════════════════════════════════════════════════════════════════════
+# Variational-family interface
+#
+# A family is a distribution `q_θ`, and VI minimizes the reverse KL
+#   J(θ) = mean_i[ -log p(ξ_i) + log q_θ(ξ_i) ],   ξ_i = T_θ(η_i),  η_i ∼ N(0,I).
+# `VIState.position` holds the variational parameters θ that the optimizer moves; the
+# likelihood always consumes a latent point ξ. The reparameterization `T_θ` is sliced at
+# the boundary between what is *frozen* at the current θ and what is *differentiated*:
+#
+#   transform_block — the frozen prefix, evaluated at the current θ and held constant,
+#                     producing a stored residual. Trivial (`= ε`) for pushforward
+#                     families; a CG solve (+ curve) for the Fisher-Gaussian families.
+#   transport         — the differentiated suffix, reconstructing ξ from θ + residual.
+#
+# REQUIRED of a new family: `init_params` and (unless θ is itself the latent point)
+# `transport`. Every other hook below has a default targeting the pushforward/common case
+# (mean-field, normalizing flows). Concrete families live in the sibling files
+# (`mgvi.jl`, `geovi.jl`, `fisher_gaussian.jl`, `meanfield.jl`).
+# ════════════════════════════════════════════════════════════════════════════
+
+"""
+    AbstractVariationalFamily
+
+Marker supertype for variational families. A family is the distribution `q_θ`; VI
+minimizes the reverse KL `J(θ) = mean_i[-log p(ξ_i) + log q_θ(ξ_i)]` with
+`ξ_i = T_θ(η_i)`, `η_i ∼ N(0,I)`. It carries the solvers its draw needs, but no
+outer-optimization or Monte-Carlo-budget knobs — those live on the
+[`MCEstimator`](@ref) estimator and the optimizer respectively.
+
+To add a family, subtype `AbstractVariationalFamily` and implement
+`GeoVI.init_params` and `GeoVI.transport` (the latter only if `θ` is not
+itself the latent point). Optional hooks, each with a default targeting the
+pushforward case (mean-field, normalizing flows): `GeoVI.logdensity`
+(the family's log-density `log q_θ`; `0`/no-op by default), `GeoVI.transform_block` /
+`GeoVI.init_noise` / `GeoVI.draw_noise` (the frozen draw; identity /
+single latent buffer by default), and — only to enable the `NewtonCG` optimizer —
+`GeoVI.supports_natural_gradient` + `GeoVI.natural_gradient_metric`.
+"""
+abstract type AbstractVariationalFamily end
+
+# ── Required (with pushforward-friendly defaults) ────────────────────────────
+
+# Build θ from the user's initial latent point.
+init_params(::AbstractVariationalFamily, initial_latent) = copy(initial_latent)
+
+# Reconstruct a latent point ξ from θ and one stored residual. DIFFERENTIATED through θ,
+# so a structured θ stays differentiable. Default: θ is itself the latent point.
+transport(::AbstractVariationalFamily, θ, residual) = θ .+ residual
+
+# ── The frozen draw (`transform_block`) and the white noise it consumes ──────
+#
+# `transform_block(family, lh, θ, noise_i, mirrored)` de-whitens ONE base draw's noise
+# into a residual block (1 row, or 2 antithetic rows when `mirrored`) at the current θ —
+# the *frozen* part of the reparameterization. `draw_noise`/`init_noise` declare and
+# fill the white noise it consumes.
+
+# Default (pushforward families — mean-field, normalizing flows): the frozen prefix is the
+# identity, so the stored residual *is* the white noise ε (the work happens in `transport`).
+transform_block(::AbstractVariationalFamily, lh::AbstractLikelihood, θ, ε, mirrored::Bool) =
+    mirrored ? _stack_residuals(ε, -ε) : _single_sample_block(ε)
+
+# The family's per-base-draw white-noise bundle, sized for `n` base draws. DEFAULT: a
+# single latent-shaped buffer ε (the pushforward case). `latent` is a latent-shaped
+# template (the user's initial ξ₀). The bundle may be any Functors-traversable structure
+# of arrays; `sample!` fills every leaf and `transform!` slices each per base draw.
+init_noise(::AbstractVariationalFamily, adtype, lh, latent, n) =
+    similar(latent, (n, size(latent)...))
+
+# Default single fresh white-noise draw (backs `rand`): a latent-shaped ε. A structured-θ
+# family overrides it to draw in latent shape.
+draw_noise(::AbstractVariationalFamily, lh::AbstractLikelihood, θ, rng::AbstractRNG) =
+    randn_like(rng, θ)
+
+# ── The family's log-density `log q_θ(ξ)` ────────────────────────────────────
+
+# The per-sample variational log-density `log q_θ(ξ)` at the drawn sample
+# `ξ = transport(family, θ, ε)`, written as a function of the reparam noise ε (the same
+# object `transport` consumes — cheaper than re-deriving ε from ξ, and a flow gets its
+# `log|det J|` straight from the forward pass). Returned up to a global additive constant
+# (the normalization), which no f-divergence's reduction depends on.
+#
+# This is the family's contribution to every f-divergence objective: the reverse KL is
+# `J(θ) = mean_i[-log p(ξ_i) + logdensity(family, θ, ε_i)]`, and a general f-divergence
+# combines the per-sample log density-ratio `w_i = log p(ξ_i) - logdensity(family, θ, ε_i)`.
+#
+# Default `false` (a typed zero, so `x + false === x` and the term vanishes): the family
+# contributes no varying log-density. For the Fisher-Gaussian families (MGVI/geoVI) this
+# is the *fixed-metric approximation* — the covariance is pinned to `(I + Fisher(μ))⁻¹` and
+# its entropy is held constant, so the gradient is 0 (they have no tractable `log q` to
+# form anyway). Families with a tractable density override it (mean-field below; a
+# normalizing flow returns `-½‖ε‖² - log|det J_θ|`). Extends the likelihood's `logdensity`.
+logdensity(::AbstractVariationalFamily, θ, ε) = zero(eltype(ε))
+
+# ── Natural-gradient metric (an *optimizer* concern, not a family property) ──
+#
+# The metric is consumed *only* by `NewtonCG` (its inner CG solve and line-search
+# curvature); a bare `Optimisers.jl` rule never asks for it. So it is not part of the
+# core family interface: a family opts in to being usable with `NewtonCG` by setting
+# `supports_natural_gradient` and implementing `natural_gradient_metric`.
+
+supports_natural_gradient(::AbstractVariationalFamily) = false
+
+# Default: undefined ⇒ this family cannot be used with `NewtonCG`.
+function natural_gradient_metric(
+        family::AbstractVariationalFamily, lh::AbstractLikelihood, θ, residuals, v::AbstractArray
+    )
+    throw(
+        ArgumentError(
+            "`$(nameof(typeof(family)))` defines no natural-gradient metric; `NewtonCG` " *
+                "requires one. Use an `Optimisers.jl` rule, or implement " *
+                "`GeoVI.natural_gradient_metric` (and `GeoVI.supports_natural_gradient`) for it.",
+        ),
+    )
+end
+
+# ── The fitted variational distribution ─────────────────────────────────────
+#
+# Fitting produces parameters θ; bound to its family (and likelihood) those parameters
+# *are* a distribution `q_θ`. `distribution` instantiates that first-class object — the
+# exported output of `fit`. Each family returns its own concrete `AbstractVariational
+# Distribution` subtype (in its file). `rand(rng, d[, n])` is the universal capability
+# (always cheap to *call*; for the Fisher-Gaussian families a draw is a CG solve);
+# `logdensity` is optional — defined only where the density is tractable.
+
+abstract type AbstractVariationalDistribution end
+
+"""
+    distribution(family, θ, likelihood) -> AbstractVariationalDistribution
+
+Instantiate the variational distribution `q_θ` for `family` at parameters `θ` (the
+`likelihood` is carried for families whose draw needs it, e.g. MGVI/geoVI). Works at any
+`θ`, not just a fitted one. Each family implements its own method returning its concrete
+distribution type; see also `distribution(problem, state)`.
+"""
+function distribution(family::AbstractVariationalFamily, θ, likelihood)
+    throw(
+        ArgumentError(
+            "`$(nameof(typeof(family)))` does not define `distribution`; implement " *
+                "`GeoVI.distribution(::$(nameof(typeof(family))), θ, likelihood)`.",
+        ),
+    )
+end
+
+"""
+    logdensity(d::AbstractVariationalDistribution, ξ) -> Real
+
+The variational log-density `log q(ξ)` at a latent point `ξ` (mirrors `logdensity(lh, ξ)`
+for the model). Optional: defined only for families with a tractable density (mean-field;
+not MGVI/geoVI, whose normalization is an intractable log-determinant). `rand` is always
+available even when this is not.
+"""
+function logdensity(d::AbstractVariationalDistribution, ξ)
+    throw(
+        ArgumentError(
+            "`$(nameof(typeof(d)))` has no tractable `logdensity` (only `rand` is available).",
+        ),
+    )
+end
+
+# Shared: `n` independent draws stacked along a leading axis (each row a latent point).
+# Reuses the per-distribution `rand(rng, d)`; the first draw also fixes the output shape.
+Base.rand(d::AbstractVariationalDistribution) = rand(Random.default_rng(), d)
+Base.rand(d::AbstractVariationalDistribution, n::Integer) = rand(Random.default_rng(), d, n)
+function Base.rand(rng::AbstractRNG, d::AbstractVariationalDistribution, n::Integer)
+    n >= 0 || throw(ArgumentError("`n` must be non-negative"))
+    first = rand(rng, d)
+    out = similar(first, (n, size(first)...))
+    trailing = ntuple(_ -> Colon(), ndims(first))
+    n >= 1 && (out[1, trailing...] = first)
+    @trace track_numbers = false for i in 2:n
+        out[i, trailing...] = rand(rng, d)
+    end
+    return out
+end

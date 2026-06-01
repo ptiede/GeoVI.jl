@@ -51,46 +51,7 @@ function recenter(samples::Samples, new_position)
     return Samples(new_position, _subtract_position(shifted, new_position); keys = samples.keys)
 end
 
-"""
-    VariationalPosterior(likelihood, position, family, samples)
-
-The fitted variational distribution. `position` is the latent mean; `family`
-records how to draw from it. The `samples` drawn during fitting are retained
-and accessible, but the posterior is a *distribution*: call `rand` to draw
-arbitrary new samples and `mean` to get the latent mean.
-"""
-struct VariationalPosterior{L, P, F, S}
-    likelihood::L
-    position::P
-    family::F
-    samples::S
-end
-
-mean(post::VariationalPosterior) = post.position
-
-function Base.rand(rng::AbstractRNG, post::VariationalPosterior)
-    return post.position .+
-        _draw_one_residual(post.family, post.likelihood, post.position, rng)
-end
-
-Base.rand(post::VariationalPosterior) = rand(Random.default_rng(), post)
-
-function Base.rand(rng::AbstractRNG, post::VariationalPosterior, n::Integer)
-    n >= 0 || throw(ArgumentError("`n` must be non-negative"))
-    # Each draw has the shape of the latent mean, so allocate straight from
-    # `post.position` and fill all `n` rows in the loop (no special-cased first
-    # draw). `@trace for` so a *compiled* `rand` builds a single MLIR while-loop
-    # body instead of `n` trace-time-unrolled copies of the residual-draw graph
-    # (a CG solve, and for `GeoVIFamily` the full nonlinear curve). On the host
-    # path `@trace for` is a plain loop, so this is unchanged there.
-    # `track_numbers = false` keeps the deep type-walk away from the plain
-    # Int/Bool fields in the family/likelihood closure environment.
-    out = similar(post.position, (n, size(post.position)...))
-    trailing = ntuple(_ -> Colon(), ndims(post.position))
-    @trace track_numbers = false for i in 1:n
-        out[i, trailing...] = rand(rng, post)
-    end
-    return out
-end
-
-Base.rand(post::VariationalPosterior, n::Integer) = rand(Random.default_rng(), post, n)
+# The fitted variational distribution is `AbstractVariationalDistribution` (see
+# `src/families/`): `fit`/`distribution` return a per-family distribution object you draw
+# from with `rand`. `Samples` above is the internal expansion-point + residuals container
+# used during fitting (and returned by `draw_residuals`).
