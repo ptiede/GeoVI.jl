@@ -42,6 +42,28 @@ function fishermetric(lh::AbstractLikelihood, y, v)
     return leftsqrtmetric(lh, y, rightsqrtmetric(lh, y, v))
 end
 
+# ── Likelihood pinned at a point ─────────────────────────────────────────────
+#
+# `_at_point(lh, x)` pins `lh` at the latent point `x` and returns a handle whose
+# 2-arg `fishermetric`/`leftsqrtmetric`/`rightsqrtmetric`/`transformation` reuse all
+# per-point work. This is the hot-path contract: a CG solve applies the metric many
+# times at one fixed point, so anything `x`-dependent (in particular the forward-model
+# linearization of `ComposedLikelihood`, see `likelihoods/composed.jl`) must be derived
+# once per point, not once per matvec. The fallback handle just closes over `(lh, x)` —
+# plain likelihoods have no per-point setup worth caching.
+struct _LikelihoodAtPoint{L, X}
+    lh::L
+    x::X
+end
+
+_at_point(lh::AbstractLikelihood, x) = _LikelihoodAtPoint(lh, x)
+
+_point(h::_LikelihoodAtPoint) = h.x
+fishermetric(h::_LikelihoodAtPoint, v) = fishermetric(h.lh, h.x, v)
+leftsqrtmetric(h::_LikelihoodAtPoint, η) = leftsqrtmetric(h.lh, h.x, η)
+rightsqrtmetric(h::_LikelihoodAtPoint, v) = rightsqrtmetric(h.lh, h.x, v)
+transformation(h::_LikelihoodAtPoint) = transformation(h.lh, h.x)
+
 _sum_logdensity(x) = real(sum(x))
 
 _infer_sqrt_precision(precision::Number) = sqrt(precision)

@@ -13,6 +13,12 @@ const FisherGaussian = Union{MGVIFamily, GeoVIFamily}
 # loop, so this compiles under Reactant), in the order metric-leaf then prior-leaf. The
 # `@trace for` over base draws then de-whitens each slice into a residual block: build the
 # metric sample, CG-solve for the linear residual, refine (MGVI: none; geoVI: the curve).
+# Family-level linear-draw options: the solver's CG settings plus the family's
+# `strict` flag (eager CG non-convergence throws only when `strict = true`; under a
+# Reactant trace runtime throwing is disabled wholesale by `_runtime_failure_enabled`).
+_draw_linear_kwargs(fam::FisherGaussian) =
+    (; _draw_linear_kwargs(fam.solver)..., throw_on_failure = fam.strict)
+
 function draw_samples!(
         fam::FisherGaussian, lh::AbstractLikelihood, μ, residuals, rng::AbstractRNG,
         mirrored::Bool,
@@ -27,7 +33,7 @@ function draw_samples!(
         ms = _metric_sample_from_white(
             lh, μ, _sample_slice(metric_white, i), _sample_slice(prior_white, i)
         )
-        linear = draw_linear_residual(lh, μ, ms; _draw_linear_kwargs(fam.solver)...)
+        linear = draw_linear_residual(lh, μ, ms; _draw_linear_kwargs(fam)...)
         _write_sample_block!(residuals, i, _refine_residual(fam, lh, μ, linear, ms, mirrored))
     end
     return residuals
@@ -44,17 +50,55 @@ function natural_gradient_metric(
     # `θ` is the latent point for the Fisher-Gaussian families, so it is the MAP point.
     residuals === nothing && return _posterior_metric(lh, θ, v)
 
-    result = zero(v)
+    acc = zero(v)
     n = _sample_count(residuals)
     @trace track_numbers = false for i in 1:n
-        result = result .+ _posterior_metric(
+        acc .+= fishermetric(
             lh,
             first(transport_and_logjac(family, θ, _sample_slice(residuals, i))),
             v,
-        ) ./ n
+        )
     end
-    return result
+    # mean_i(Fisher_i v) + v — accumulate first, divide once.
+    acc ./= n
+    return acc .+ v
 end
+
+# Pinning the field at a base point (`NaturalGradientField` evaluation, once per Newton
+# iteration): pin every sample point's likelihood handle (`_at_point`, caching the
+# forward-model linearization), so each inner-CG matvec only *applies* the cached
+# linearizations. Under a Reactant trace return the generic re-deriving
+# `NaturalGradientOperator` instead — a host vector of per-sample handles cannot be
+# indexed by a traced loop variable, and unrolling n forward models into the CG body is
+# exactly what the `@trace` loops avoid. (`within_compile()` is a host-side,
+# compile-time branch, never a traced one. XLA dedupes the re-derived linearizations
+# inside the traced loop body anyway.)
+struct _CachedFisherOperator{H}
+    handles::H
+    n::Int
+end
+function (op::_CachedFisherOperator)(v)
+    acc = zero(v)
+    for h in op.handles
+        acc .+= fishermetric(h, v)
+    end
+    acc ./= op.n
+    return acc .+ v
+end
+
+function _natural_gradient_operator(
+        family::FisherGaussian, lh::AbstractLikelihood, base, residuals
+    )
+    residuals === nothing && return _PosteriorMetricOperator(lh, base)
+    within_compile() && return NaturalGradientOperator(family, lh, base, residuals)
+    n = _sample_count(residuals)
+    handles = map(
+        i -> _at_point(lh, first(transport_and_logjac(family, base, _sample_slice(residuals, i)))),
+        1:n,
+    )
+    return _CachedFisherOperator(handles, n)
+end
+
 
 # ── The fitted distribution: shared by MGVI and geoVI ────────────────────────
 # A draw is a CG solve against the posterior Fisher at the mean (geoVI adds the curve), so
@@ -75,7 +119,7 @@ function Base.rand(rng::AbstractRNG, d::FisherGaussianDistribution)
     ms = _metric_sample_from_white(
         lh, μ, randn_like(rng, _metric_tangent_template(lh, μ)), randn_like(rng, μ)
     )
-    linear = draw_linear_residual(lh, μ, ms; _draw_linear_kwargs(fam.solver)...)
+    linear = draw_linear_residual(lh, μ, ms; _draw_linear_kwargs(fam)...)
     block = _refine_residual(fam, lh, μ, linear, ms, false)
     return first(transport_and_logjac(fam, μ, _sample_slice(block, 1)))
 end

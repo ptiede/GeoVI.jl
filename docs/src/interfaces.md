@@ -97,7 +97,13 @@ natively; such a family overrides `transport_and_logjac` (and its own distributi
 `GeoVI.draw_samples!(family, lh, θ, residuals, rng, mirrored)` (whose default fills the
 buffer with IID white noise, writing antithetic ±ε pairs when `mirrored`). To be usable
 with the `NewtonCG` optimizer, also set `GeoVI.supports_natural_gradient(family) = true`
-and implement `GeoVI.natural_gradient_metric(family, lh, θ, residuals, v)`.
+and implement `GeoVI.natural_gradient_metric(family, lh, θ, residuals, v)`. The metric
+reaches the optimizer as a `NaturalGradientField` — the metric *field* over θ-space,
+which `NewtonCG` evaluates at the current base point once per Newton iteration. Pinning
+the field at a base point goes through `GeoVI._natural_gradient_operator(family, lh,
+base, residuals)`, whose default returns the re-deriving `NaturalGradientOperator`; a
+family may override it to hoist per-base work out of the inner-CG matvec loop (the
+Fisher-Gaussian families cache every sample point's forward-model linearization there).
 
 A complete minimal pushforward family is just `init_params` + `transport_and_logjac` —
 no solver, no metric, no buffer plumbing.
@@ -111,9 +117,20 @@ expectation `E_q[·]` — a property of the expectation, not the family:
 abstract type AbstractEstimator end
 ```
 
-The built-in estimator is `MCEstimator(; n_samples, mirrored)`. To add a new
-estimator, subtype `AbstractEstimator` and provide `_n_base_draws` and a
-`draw_residuals(family, estimator, lh, position, rng)` method.
+The built-in estimator is `MCEstimator(; n_samples=4, mirrored=true)`. The VI
+loop consults the estimator only through three accessors — never struct fields —
+so a custom estimator subtypes `AbstractEstimator` and implements:
+
+```julia
+GeoVI._n_stored_samples(est)  # rows in the residual buffer (mirrored pairs count as two)
+GeoVI._mirrored(est)          # whether the rows are antithetic ±pairs
+GeoVI._n_base_draws(est)      # independent base draws
+```
+
+`n_samples = 0` (sample-free MAP) is only valid for families whose parameters
+are themselves the latent point (MGVI/geoVI); structured-θ families require
+samples. The standalone `draw_residuals(family, estimator, lh, position, rng)`
+helper uses the same accessors.
 
 ## Divergences
 
@@ -141,10 +158,15 @@ Families* above.
 GeoVI accepts, as the outer position optimizer:
 
 - built-in optimizers that subtype `AbstractOptimizer` (`NewtonCG`), which run to
-  convergence within one position update. `NewtonCG` enables energy-based
-  convergence (and the inner-CG energy-decrease coupling) when given `absdelta`
-  (absolute) or `delta` (per-degree-of-freedom; `absdelta = delta·length(x0)` at
-  solve time, since the energy is a sum over latent dimensions)
+  convergence within one position update. `NewtonCG` is *inexact* Newton: its
+  inner CG stops at the Eisenstat–Walker forcing threshold `min(0.5, √‖g‖)·‖g‖`
+  derived from the current gradient. `cg_rtol`/`cg_atol` default to `nothing`
+  (forcing alone); when set they can only **tighten** the inner solve, via
+  `min(forcing, max(cg_atol, cg_rtol·‖g‖))` — to spend *less* inner effort use
+  `cg_maxiter` or the energy coupling instead. Energy-based convergence (and the
+  inner-CG energy-decrease coupling) is enabled by `absdelta` (absolute) or
+  `delta` (per-degree-of-freedom; `absdelta = delta·length(x0)` at solve time,
+  since the energy is a sum over latent dimensions)
 - a bare `Optimisers.AbstractRule` (e.g. `Optimisers.Adam(0.05)`), which takes a
   single gradient step per `step_vi!` — the user's loop provides the iterations
 
@@ -169,7 +191,13 @@ _optimize(
 )
 ```
 
-The return value should be an `OptimizationResult`.
+The return value should be an `OptimizationResult`. `metricp` is a metric *field*
+over the parameter space (e.g. a `NaturalGradientField`): `metricp(x)` pins the
+field at the base point `x`, returning the operator `v -> M(x)·v` on the tangent
+space there — evaluate it once per outer iteration and reuse the pinned operator
+for every application (inner-CG matvecs, line-search curvature), since pinning
+may cache expensive per-base work such as a forward-model linearization (see
+`GeoVI._at_point`).
 
 If the backend carries state across outer VI iterations, also implement:
 
@@ -241,6 +269,13 @@ end
 ## AD Backends
 
 Automatic differentiation backends are selected with `ADTypes.jl`.
+
+!!! warning "The finite-difference default is O(D) more expensive"
+    The default `adtype = AutoFiniteDiff()` needs no extra packages, but each
+    gradient costs `2·length(ξ₀)` objective evaluations — and each objective
+    evaluation is an `n_samples` Monte-Carlo sum over the forward model. For
+    anything beyond toy problems, load Enzyme and pass `adtype = AutoEnzyme()`
+    (automatically upgraded to `AutoReactant` for Reactant arrays).
 
 To add a new backend, implement:
 

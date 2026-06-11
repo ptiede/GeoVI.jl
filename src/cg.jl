@@ -54,8 +54,8 @@ function _cg_step(denom, rr, x, r, p, Ap)
 end
 
 struct ConjugateGradient
-    rtol::Float64
-    atol::Float64
+    rtol::Union{Nothing, Float64}
+    atol::Union{Nothing, Float64}
     maxiter::Union{Nothing, Int}
     miniter::Int
     absdelta::Union{Nothing, Float64}
@@ -65,25 +65,30 @@ end
     ConjugateGradient(; rtol=1e-8, atol=0.0, maxiter=nothing, miniter=0, absdelta=nothing)
 
 Matrix-free CG. Stops when the residual norm drops below `max(atol, rtol·‖b‖)`
-(or an explicit per-call `threshold`). If `absdelta` is set (or passed per call,
-as the Newton-CG outer loop does), CG also stops once the decrease in its
-quadratic energy `φ(x) = ½xᵀAx − bᵀx` between iterations falls below `absdelta`
-— a progress-based criterion that couples inner CG effort to outer optimization
-gains.
+(or an explicit per-call `threshold`). Either tolerance may be `nothing`,
+meaning that criterion is absent (it contributes `0` to the `max`, so with both
+absent the solve runs until `maxiter`/`absdelta` stop it). If `absdelta` is set
+(or passed per call, as the Newton-CG outer loop does), CG also stops once the
+decrease in its quadratic energy `φ(x) = ½xᵀAx − bᵀx` between iterations falls
+below `absdelta` — a progress-based criterion that couples inner CG effort to
+outer optimization gains.
 """
 function ConjugateGradient(; rtol = 1.0e-8, atol = 0.0, maxiter = nothing, miniter = 0, absdelta = nothing)
-    rtol >= 0 || throw(ArgumentError("`rtol` must be non-negative"))
-    atol >= 0 || throw(ArgumentError("`atol` must be non-negative"))
+    rtol === nothing || rtol >= 0 || throw(ArgumentError("`rtol` must be non-negative"))
+    atol === nothing || atol >= 0 || throw(ArgumentError("`atol` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
     maxiter !== nothing && maxiter < 0 && throw(ArgumentError("`maxiter` must be non-negative"))
     return ConjugateGradient(
-        Float64(rtol),
-        Float64(atol),
+        rtol === nothing ? nothing : Float64(rtol),
+        atol === nothing ? nothing : Float64(atol),
         maxiter === nothing ? nothing : Int(maxiter),
         Int(miniter),
         absdelta === nothing ? nothing : Float64(absdelta),
     )
 end
+
+# A `nothing` tolerance contributes 0, i.e. the criterion is absent.
+_tol_or_zero(tol) = tol === nothing ? 0.0 : float(tol)
 
 function _cg_iterate(
         operator, b, rr, x, r, p, iteration, breakdown, miniter, ad_miniter, threshold, absdelta,
@@ -97,13 +102,7 @@ function _cg_iterate(
     keep_going, converged = _check_conv(iteration, miniter, residual_norm, threshold)
     # CG quadratic energy φ(x) = ½xᵀAx − bᵀx; with `r = b − Ax` this is
     # −½·Re⟨x, b + r⟩. Stop once its per-iteration decrease falls below
-    # `absdelta`. The `absdelta === nothing` guard is a COMPILE-TIME type check
-    # (`Nothing` vs a number), resolved at trace time — never a runtime branch on
-    # a traced value. So: with the default `nothing` the extra dot product and
-    # the stop never enter the loop (residual-norm path byte-identical to having
-    # no energy criterion); otherwise `absdelta` may be a plain OR traced number
-    # (the latter from Newton's adaptive coupling), and the comparison goes
-    # through `@trace if`. `ad_miniter` floors the criterion at ~6 iters (NIFTy.re).
+    # `absdelta`.
     new_energy = energy
     if absdelta !== nothing
         new_energy = -0.5 * real(dot(x, b .+ r))
@@ -181,7 +180,7 @@ function solve(cg::ConjugateGradient, operator, b; x0 = nothing, threshold = not
     maxiter = cg.maxiter === nothing ? max(20, 2 * length(b)) : cg.maxiter
     # An explicit `threshold` (e.g. an Eisenstat–Walker forcing term from the
     # Newton-CG outer loop) overrides the static `atol`/`rtol` criterion.
-    thr = threshold === nothing ? max(float(cg.atol), float(cg.rtol) * norm(b)) : threshold
+    thr = threshold === nothing ? max(_tol_or_zero(cg.atol), _tol_or_zero(cg.rtol) * norm(b)) : threshold
     # Per-call `absdelta` (e.g. a fraction of the last Newton energy gain)
     # overrides the static field; `nothing` (either source) disables the energy
     # criterion via the compile-time `=== nothing` guards in `_cg_run`.

@@ -10,39 +10,49 @@ struct MirroredResidualDraw{R, L, N}
     negative::N
 end
 
+# `hep` is the expansion-point likelihood handle (`_at_point`), pinned ONCE for the
+# whole nonlinear optimize; `hx` is pinned once per objective/metric evaluation at the
+# moving point. For a `ComposedLikelihood` each handle caches one forward-model
+# linearization, so an objective evaluation costs one linearization (at `x`) instead
+# of three, and a metric matvec costs zero new linearizations.
 function _nonlinear_residual_value_and_gradient(
         lh::AbstractLikelihood,
+        hep,
         expansion_point::AbstractArray,
         transformation_at_point::AbstractArray,
         metric_sample::AbstractArray,
         x::AbstractArray,
     )
-    t = transformation(lh, x) .- transformation_at_point
-    g = x .- expansion_point .+ leftsqrtmetric(lh, expansion_point, t)
+    hx = _at_point(lh, x)
+    t = transformation(hx) .- transformation_at_point
+    g = x .- expansion_point .+ leftsqrtmetric(hep, t)
     r = metric_sample .- g
-    value = 0.5 * real(dot(r, r))
+    value = real(dot(r, r)) / 2
 
     r̄ = conj.(r)
-    grad = -(r̄ .+ leftsqrtmetric(lh, x, rightsqrtmetric(lh, expansion_point, r̄)))
+    grad = -(r̄ .+ leftsqrtmetric(hx, rightsqrtmetric(hep, r̄)))
     return value, grad
 end
 
-function _nonlinear_residual_metric(
-        lh::AbstractLikelihood,
-        expansion_point::AbstractArray,
-        x::AbstractArray,
-        v::AbstractArray,
-    )
-    tm = leftsqrtmetric(lh, expansion_point, rightsqrtmetric(lh, x, v)) .+ v
-    return leftsqrtmetric(lh, x, rightsqrtmetric(lh, expansion_point, tm)) .+ tm
+# Convenience form (used by tests/standalone callers): pins the expansion point per call.
+_nonlinear_residual_value_and_gradient(
+    lh::AbstractLikelihood,
+    expansion_point::AbstractArray,
+    transformation_at_point::AbstractArray,
+    metric_sample::AbstractArray,
+    x::AbstractArray,
+) = _nonlinear_residual_value_and_gradient(
+    lh, _at_point(lh, expansion_point), expansion_point, transformation_at_point,
+    metric_sample, x,
+)
+
+function _nonlinear_residual_metric(hep, hx, v::AbstractArray)
+    tm = leftsqrtmetric(hep, rightsqrtmetric(hx, v)) .+ v
+    return leftsqrtmetric(hx, rightsqrtmetric(hep, tm)) .+ tm
 end
 
-function _nonlinear_residual_stepnorm(
-        lh::AbstractLikelihood,
-        expansion_point::AbstractArray,
-        step::AbstractArray,
-    )
-    pushed = rightsqrtmetric(lh, expansion_point, step)
+function _nonlinear_residual_stepnorm(hep, step::AbstractArray)
+    pushed = rightsqrtmetric(hep, step)
     return sqrt(real(dot(step, step)) + real(dot(pushed, pushed)))
 end
 
@@ -112,28 +122,36 @@ function update_nonlinear_residual(
         return NonlinearResidualUpdate(residual_sample, result)
     end
 
-    transformation_at_point = transformation(lh, expansion_point)
+    # Pin the expansion point ONCE for the whole optimize: its linearization is reused
+    # by every objective evaluation, metric matvec, and stepnorm below.
+    hep = _at_point(lh, expansion_point)
+    transformation_at_point = transformation(hep)
     result = _optimize(
         optimizer,
         sample0;
         fun_and_grad = x -> _nonlinear_residual_value_and_gradient(
             lh,
+            hep,
             expansion_point,
             transformation_at_point,
             metric_sample_array,
             x,
         ),
-        metricp = (x, v) -> _nonlinear_residual_metric(lh, expansion_point, x, v),
+        # Curried: pin the moving point once per Newton iteration; matvecs only apply.
+        metricp = x -> begin
+            hx = _at_point(lh, x)
+            v -> _nonlinear_residual_metric(hep, hx, v)
+        end,
         maxiter = maxiter,
         miniter = _option(optimizer_options, :miniter, 0),
         xtol = _option(optimizer_options, :xtol, 1.0e-5),
         absdelta = _option(optimizer_options, :absdelta, nothing),
         delta = _option(optimizer_options, :delta, nothing),
-        cg_rtol = _option(optimizer_options, :cg_rtol, 1.0e-8),
-        cg_atol = _option(optimizer_options, :cg_atol, 0.0),
+        cg_rtol = _option(optimizer_options, :cg_rtol, nothing),
+        cg_atol = _option(optimizer_options, :cg_atol, nothing),
         cg_maxiter = _option(optimizer_options, :cg_maxiter, nothing),
         cg_miniter = _option(optimizer_options, :cg_miniter, 0),
-        stepnorm = step -> _nonlinear_residual_stepnorm(lh, expansion_point, step),
+        stepnorm = step -> _nonlinear_residual_stepnorm(hep, step),
     )
 
     if throw_on_failure && _runtime_failure_enabled(sample0) && !result.converged

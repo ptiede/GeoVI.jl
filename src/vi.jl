@@ -10,6 +10,42 @@ abstract type AbstractFDivergence end
 struct ReverseKL <: AbstractFDivergence end
 struct ForwardKL <: AbstractFDivergence end
 
+# The problem input is a *position* only. `step_vi!` redraws the residuals at the start
+# of every step, so initial residuals could never influence a fit — accepting them would
+# only invite `update!`-before-`draw_samples!` misuse.
+function _problem_samples(samples::Samples)
+    samples.residuals === nothing || throw(
+        ArgumentError(
+            "the initial `Samples` must not carry residuals — `step_vi!` redraws them " *
+                "at the start of every step, so they would never be used; pass the " *
+                "position alone",
+        ),
+    )
+    return samples
+end
+_problem_samples(position::AbstractArray) = Samples(position, nothing; keys = nothing)
+
+"""
+    VariationalProblem(lh, position_or_samples; family, divergence, estimator, optimizer, adtype)
+
+Bundle a likelihood with the four orthogonal VI axes (`family`, `divergence`,
+`estimator`, `optimizer`) plus the AD backend. `position_or_samples` is the
+initial latent point `ξ₀` (a flat white array) or a [`Samples`](@ref) whose
+`position` is `ξ₀` (and whose residuals must be `nothing` — [`step_vi!`](@ref)
+redraws the sample set at the start of every step, so initial residuals could
+never be used).
+
+Every construction path validates the axis combination (`NewtonCG` requires a
+natural-gradient family; structured-θ families require `n_samples > 0`; only
+`ReverseKL` is implemented).
+
+!!! note "AD backend cost"
+    The default `adtype = AutoFiniteDiff()` needs no extra packages but costs
+    `2·length(ξ₀)` objective evaluations per gradient — each an `n_samples`
+    Monte-Carlo sum over the forward model. For anything beyond toy problems
+    load Enzyme and pass `adtype = AutoEnzyme()` (inferred as `AutoReactant`
+    automatically for Reactant arrays).
+"""
 struct VariationalProblem{L, S, F, D, E, O, AD}
     likelihood::L
     initial_samples::S
@@ -18,10 +54,19 @@ struct VariationalProblem{L, S, F, D, E, O, AD}
     estimator::E
     optimizer::O
     adtype::AD
-end
 
-_problem_samples(samples::Samples) = samples
-_problem_samples(position::AbstractArray) = Samples(position, nothing; keys = nothing)
+    function VariationalProblem(lh, position_or_samples, family, divergence, estimator, optimizer, adtype)
+        samples = _problem_samples(position_or_samples)
+        # Validation is host-only: under a Reactant trace the problem may be
+        # reconstructed with traced fields, where re-validating is wasted work.
+        within_compile() ||
+            _require_supported(family, divergence, estimator, optimizer, samples.position)
+        return new{
+            typeof(lh), typeof(samples), typeof(family), typeof(divergence),
+            typeof(estimator), typeof(optimizer), typeof(adtype),
+        }(lh, samples, family, divergence, estimator, optimizer, adtype)
+    end
+end
 
 _infer_adtype(adtype, x) = adtype
 
@@ -41,7 +86,6 @@ function VariationalProblem(
     )
     adtype === nothing && (adtype = ADTypes.AutoFiniteDiff())
     samples = _problem_samples(position_or_samples)
-    _require_supported(family, divergence, estimator, optimizer)
     return VariationalProblem(
         lh,
         samples,
@@ -81,9 +125,15 @@ end
 
 _wrap_rng(_adtype, rng) = rng
 
+# Zero-filled, never uninitialized: there is no "residuals not yet drawn" state after
+# `init`. (Zero residuals are the degenerate sample set collapsed onto the mean, so even a
+# custom loop calling `GeoVI.update!` before the first `GeoVI.draw_samples!` is
+# well-defined, not reading garbage.)
 function _init_residual_buffer(problem::VariationalProblem, latent)
-    problem.estimator.n_samples == 0 && return nothing
-    return similar(latent, (problem.estimator.n_samples, size(latent)...))
+    n_stored = _n_stored_samples(problem.estimator)
+    n_stored == 0 && return nothing
+    residuals = similar(latent, (n_stored, size(latent)...))
+    return fill!(residuals, zero(eltype(residuals)))
 end
 
 # Fresh optimizer state for the chosen optimizer (`nothing` for the stateless
@@ -100,6 +150,9 @@ and return it together with the loop RNG to thread through [`step_vi!`](@ref). F
 an `AutoReactant` problem the RNG is wrapped into a `Reactant.ReactantRNG` (the
 compiled step is built lazily by `fit`, or by the user calling
 `@compile step_vi!(...)`). `rng` defaults to `Random.default_rng()`.
+
+The residual buffer starts zero-filled; [`step_vi!`](@ref) redraws it at the
+start of every step.
 """
 function init(rng::AbstractRNG, problem::VariationalProblem)
     θ = init_params(problem.family, problem.initial_samples.position)
@@ -152,22 +205,26 @@ draw_residuals(problem::VariationalProblem, position::AbstractArray, rng::Abstra
 
 function draw_residuals(
         family::AbstractVariationalFamily,
-        estimator::MCEstimator,
+        estimator::AbstractEstimator,
         lh::AbstractLikelihood,
         position::AbstractArray,
         rng::AbstractRNG,
     )
     n = _n_base_draws(estimator)
+    mirrored = _mirrored(estimator)
     if n == 0
         return Samples(position, nothing; keys = nothing),
-            (family = family, mirrored = estimator.mirrored, n_draws = 0)
+            (family = family, mirrored = mirrored, n_draws = 0)
     end
 
-    residuals = similar(position, (estimator.n_samples, size(position)...))
-    draw_samples!(family, lh, position, residuals, rng, estimator.mirrored)
+    n_stored = _n_stored_samples(estimator)
+    residuals = similar(position, (n_stored, size(position)...))
+    draw_samples!(family, lh, position, residuals, rng, mirrored)
 
-    return Samples(position, residuals; keys = Base.OneTo(n)),
-        (family = family, mirrored = estimator.mirrored, n_draws = n)
+    # `keys` indexes the STORED rows (mirrored pairs count as two), matching
+    # `length(samples)`.
+    return Samples(position, residuals; keys = Base.OneTo(n_stored)),
+        (family = family, mirrored = mirrored, n_draws = n)
 end
 
 # ── The two VI phases (composable primitives; unexported) ───────────────────
@@ -192,7 +249,7 @@ function draw_samples!(rng::AbstractRNG, problem::VariationalProblem, state::VIS
     state.residuals === nothing && return state
     draw_samples!(
         problem.family, problem.likelihood, state.position, state.residuals, rng,
-        problem.estimator.mirrored,
+        _mirrored(problem.estimator),
     )
     return state
 end
@@ -341,6 +398,7 @@ function _require_supported(
         divergence::AbstractFDivergence,
         estimator::AbstractEstimator,
         optimizer,
+        position,
     )
     divergence isa ReverseKL || throw(
         ArgumentError(
@@ -364,10 +422,17 @@ function _require_supported(
             ),
         )
     end
-    # Mean-field's ELBO entropy estimate needs at least one Monte-Carlo sample.
-    if family isa MeanFieldGaussian && estimator.n_samples == 0
-        throw(
-            ArgumentError("`MeanFieldGaussian` requires `n_samples > 0` for the ELBO estimate"),
+    # With no samples the objective degenerates to the negative log-posterior at θ
+    # (MAP), which is only defined when θ is itself the latent point. A structured-θ
+    # family (NamedTuple parameters, e.g. mean-field) therefore needs samples.
+    if _n_stored_samples(estimator) == 0 && position !== nothing
+        θ0 = init_params(family, position)
+        θ0 isa AbstractArray || throw(
+            ArgumentError(
+                "`$(nameof(typeof(family)))` has structured parameters " *
+                    "(θ::$(typeof(θ0)) is not the latent point), so the sample-free MAP " *
+                    "objective is undefined for it; use an estimator with `n_samples > 0`.",
+            ),
         )
     end
     return nothing
@@ -406,9 +471,7 @@ function _optimize_position(problem::VariationalProblem, position, residuals, op
             residuals,
             x,
         ),
-        # The metric closure is built unconditionally but invoked only by `NewtonCG`; a
-        # bare `Optimisers.jl` rule ignores it (so a family without a metric is fine there).
-        metricp = (x, v) -> natural_gradient_metric(family, likelihood, x, residuals, v),
+        metricp = NaturalGradientField(family, likelihood, residuals),
         optimizer_state = opt_state,
         _optimizer_kwargs(optimizer)...,
     )

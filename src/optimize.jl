@@ -12,7 +12,11 @@ const _CG_ENERGY_REDUCTION = 0.1
 Marker supertype for built-in optimizer backends.
 
 To add a new optimizer backend, subtype `AbstractOptimizer` and implement
-`_optimize(optimizer, x0; fun_and_grad, metricp, kwargs...)`. If the backend
+`_optimize(optimizer, x0; fun_and_grad, metricp, kwargs...)`. `metricp` is
+*curried*: `metricp(x)` returns the metric operator `v -> M(x)·v` at the point
+`x` — build it once per outer iteration and reuse it for every application
+(inner CG matvecs, line-search curvature), since constructing it may pin
+expensive per-point work such as a forward-model linearization. If the backend
 needs persistent state across VI iterations, also implement
 `_optimizer_state(optimizer, x0, previous_result)`.
 
@@ -23,12 +27,16 @@ abstract type AbstractOptimizer end
 
 """
     NewtonCG(; maxiter=20, miniter=0, xtol=1e-5, absdelta=nothing,
-               cg_rtol=1e-8, cg_atol=0.0, cg_maxiter=nothing, cg_miniter=0)
+               cg_rtol=nothing, cg_atol=nothing, cg_maxiter=nothing, cg_miniter=0)
 
 Inexact Newton optimizer whose inner linear system is solved by conjugate
-gradient. The CG keywords configure that intrinsic inner solve directly (a
-`NewtonCG` *is* "Newton with a CG inner solve", so there is no separate
-`ConjugateGradient` to assemble).
+gradient. The inner solve is governed by an Eisenstat–Walker forcing sequence:
+each Newton system is solved only as tightly as the current gradient warrants
+(residual target `min(0.5, √‖g‖)·‖g‖`). `cg_rtol`/`cg_atol` default to
+`nothing` (forcing alone); when set they can only *tighten* the inner solve —
+the threshold becomes `min(forcing, max(cg_atol, cg_rtol·‖g‖))`. To spend
+*less* inner effort, use `cg_maxiter` or the energy coupling below, not the
+tolerances.
 
 Energy-based convergence is opt-in via either `absdelta` (an absolute
 energy-decrease tolerance) or `delta` (the *per-degree-of-freedom* tolerance,
@@ -53,8 +61,8 @@ function NewtonCG(;
         xtol = 1.0e-5,
         absdelta = nothing,
         delta = nothing,
-        cg_rtol = 1.0e-8,
-        cg_atol = 0.0,
+        cg_rtol = nothing,
+        cg_atol = nothing,
         cg_maxiter = nothing,
         cg_miniter = 0,
     )
@@ -383,7 +391,7 @@ function _line_search_step(
         out_direction, out_oe_inc
 end
 
-function _line_search(direction0, x, value, grad, fun_and_grad, metricp)
+function _line_search(direction0, x, value, grad, fun_and_grad, metric_op)
     α = one(eltype(x))
     accepted = false
     ls_steps = 0
@@ -393,7 +401,9 @@ function _line_search(direction0, x, value, grad, fun_and_grad, metricp)
     direction = copy(direction0)
     oe_inc = 0
 
-    Mg = metricp(x, grad)
+    # `metric_op` is the operator already pinned at `x` by the caller (built once
+    # per Newton iteration), so this costs one application, not a fresh setup.
+    Mg = metric_op(grad)
     curvature = real(dot(grad, Mg))
     grad_norm_sq = real(dot(grad, grad))
     valid_curve = curvature > 0
@@ -432,8 +442,14 @@ function _newton_cg_iter(
     # system only as tightly as the current gradient warrants. Far from the
     # optimum (large ‖g‖) CG stops early; near it (small ‖g‖) CG tightens.
     # Target residual norm = min(0.5, √‖g‖) · ‖g‖  (cf. NIFTy.re / SciPy).
+    # Explicit `cg_rtol`/`cg_atol` (default `nothing`) can only TIGHTEN this:
+    # threshold = min(forcing, max(cg_atol, cg_rtol·‖g‖)). The `=== nothing`
+    # checks are host-side type checks on the config struct, never traced.
     gnorm = norm(grad)
     forcing = min(one(gnorm) / 2, sqrt(gnorm)) * gnorm
+    if cg.rtol !== nothing || cg.atol !== nothing
+        forcing = min(forcing, max(_tol_or_zero(cg.atol), _tol_or_zero(cg.rtol) * gnorm))
+    end
     # NIFTy.re energy-decrease coupling, applied ONLY when the optimizer carries
     # an `absdelta` (calibrated, e.g. via a `delta`-by-size convenience). The
     # first iteration uses `absdelta/100`; later iterations ask CG to reduce its
@@ -446,13 +462,16 @@ function _newton_cg_iter(
             absdelta / 100,
             _CG_ENERGY_REDUCTION * max(zero(value), prev_value - value),
         )
-    step, cg_info = solve(cg, v -> metricp(x, v), grad; threshold = forcing, absdelta = cg_absdelta)
+    # Pin the metric at the current `x` ONCE per Newton iteration; the inner CG
+    # applies it every matvec and the line search once more for curvature.
+    metric_op = metricp(x)
+    step, cg_info = solve(cg, metric_op, grad; threshold = forcing, absdelta = cg_absdelta)
     cg_ok = !cg_info.breakdown
     cg_iters = cg_info.iterations
 
     new_x_ls, new_value_ls, new_grad_ls, accepted, α, direction_used,
         ls_steps, he_inc, oe_inc =
-        _line_search(step, x, value, grad, fun_and_grad, metricp)
+        _line_search(step, x, value, grad, fun_and_grad, metric_op)
 
     energy_diff = value - new_value_ls
     step_size = α * stepnorm(direction_used)
@@ -511,8 +530,8 @@ function _optimize(
         xtol::Real = 1.0e-5,
         absdelta = nothing,
         delta = nothing,
-        cg_rtol::Real = 1.0e-8,
-        cg_atol::Real = 0.0,
+        cg_rtol::Union{Nothing, Real} = nothing,
+        cg_atol::Union{Nothing, Real} = nothing,
         cg_maxiter::Union{Nothing, Integer} = nothing,
         cg_miniter::Integer = 0,
         stepnorm = norm,
@@ -607,8 +626,8 @@ function _optimize(
         xtol::Real = 1.0e-5,
         absdelta = nothing,
         delta = nothing,
-        cg_rtol::Real = 1.0e-8,
-        cg_atol::Real = 0.0,
+        cg_rtol::Union{Nothing, Real} = nothing,
+        cg_atol::Union{Nothing, Real} = nothing,
         cg_maxiter::Union{Nothing, Integer} = nothing,
         cg_miniter::Integer = 0,
         stepnorm = norm,

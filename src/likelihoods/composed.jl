@@ -67,6 +67,31 @@ normalized_residual(lh::ComposedLikelihood, x) =
     normalized_residual(lh.likelihood, lh.forward(x))
 transformation(lh::ComposedLikelihood, x) = transformation(lh.likelihood, lh.forward(x))
 
+# The pinned handle caches the forward-model linearization ONCE; every 2-arg metric
+# application below reuses it. This is the whole point of `_at_point`: the 3-arg
+# `fishermetric`/`*sqrtmetric` forms (kept below for one-shot use) rebuild the
+# linearization — a forward evaluation plus AD setup — on every call, which is
+# ruinous inside a CG solve that applies the metric at one fixed point many times.
+struct _ComposedAtPoint{L, X, LIN}
+    lh::L
+    x::X
+    lin::LIN
+end
+
+_at_point(lh::ComposedLikelihood, x) = _ComposedAtPoint(lh, x, _composed_linearization(lh, x))
+
+_point(h::_ComposedAtPoint) = h.x
+transformation(h::_ComposedAtPoint) = transformation(h.lh.likelihood, h.lin.value)
+
+rightsqrtmetric(h::_ComposedAtPoint, v) =
+    rightsqrtmetric(h.lh.likelihood, h.lin.value, pushforward(h.lin, v))
+
+leftsqrtmetric(h::_ComposedAtPoint, η) =
+    pullback(h.lin, leftsqrtmetric(h.lh.likelihood, h.lin.value, η))
+
+fishermetric(h::_ComposedAtPoint, v) =
+    pullback(h.lin, fishermetric(h.lh.likelihood, h.lin.value, pushforward(h.lin, v)))
+
 function rightsqrtmetric(lh::ComposedLikelihood, x, v)
     linearization = _composed_linearization(lh, x)
     return rightsqrtmetric(

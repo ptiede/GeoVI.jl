@@ -204,11 +204,11 @@ function GeoVI._run_vi!(
     # `init` always wraps the rng into a `Reactant.ReactantRNG` for an AutoReactant
     # problem, so by here `rng` is device-side and its draws advance per compiled
     # call. (A host rng would be baked in as a compile-time constant — frozen noise.)
-    @info "GeoVI: compiling step_vi!..."
+    @debug "GeoVI: compiling step_vi!..."
     t_compile = @elapsed begin
         cstep = @compile GeoVI.step_vi!(rng, problem, state)
     end
-    @info "GeoVI: compilation done in" t_compile
+    @debug "GeoVI: compilation done in" t_compile
     for _ in 1:n_iterations
         cstep(rng, problem, state)
     end

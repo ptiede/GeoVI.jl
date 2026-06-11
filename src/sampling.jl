@@ -5,28 +5,51 @@ Marker supertype for Monte-Carlo estimators of the divergence expectation
 `E_q[·]`. The estimator owns *how many* sample nodes are used (and whether they
 are antithetically mirrored) — a property of the expectation estimate, not of
 the variational family or the solvers.
+
+A custom estimator implements `GeoVI._n_stored_samples` (rows in the residual
+buffer), `GeoVI._mirrored` (whether those rows are antithetic ±pairs), and
+`GeoVI._n_base_draws` (independent base draws). The VI loop consults only these
+accessors, never struct fields.
 """
 abstract type AbstractEstimator end
 
+function _estimator_interface_error(e::AbstractEstimator)
+    throw(
+        ArgumentError(
+            "`$(nameof(typeof(e)))` must implement `GeoVI._n_stored_samples`, " *
+                "`GeoVI._mirrored`, and `GeoVI._n_base_draws` to be used as an estimator.",
+        ),
+    )
+end
+
+_n_stored_samples(e::AbstractEstimator) = _estimator_interface_error(e)
+_mirrored(e::AbstractEstimator) = _estimator_interface_error(e)
+_n_base_draws(e::AbstractEstimator) = _estimator_interface_error(e)
+
 """
-    MCEstimator(; n_samples=0, mirrored=true)
+    MCEstimator(; n_samples=4, mirrored=true)
 
 Plain Monte-Carlo estimator. `n_samples` is the number of stored sample nodes;
 with `mirrored=true` they are drawn as antithetic pairs (requires even
 `n_samples`) and the package draws `n_samples ÷ 2` base residuals.
+`n_samples = 0` requests no samples at all — the objective degenerates to the
+negative log-posterior at the current parameters (MAP), which is only defined
+for families whose parameters are themselves the latent point (MGVI/geoVI).
 """
 struct MCEstimator <: AbstractEstimator
     n_samples::Int
     mirrored::Bool
 end
 
-function MCEstimator(; n_samples = 0, mirrored = true)
+function MCEstimator(; n_samples = 4, mirrored = true)
     n_samples >= 0 || throw(ArgumentError("`n_samples` must be non-negative"))
     mirrored && isodd(n_samples) &&
         throw(ArgumentError("mirrored sampling requires an even `n_samples`"))
     return MCEstimator(Int(n_samples), mirrored)
 end
 
+_n_stored_samples(e::MCEstimator) = e.n_samples
+_mirrored(e::MCEstimator) = e.mirrored
 _n_base_draws(e::MCEstimator) = e.mirrored ? (e.n_samples ÷ 2) : e.n_samples
 
 # Tangent-space template (a forward-model evaluation) used to size the metric white noise.
@@ -35,11 +58,14 @@ _n_base_draws(e::MCEstimator) = e.mirrored ? (e.n_samples ÷ 2) : e.n_samples
 _metric_tangent_template(lh::AbstractLikelihood, xi) = normalized_residual(lh, xi)
 _posterior_metric(lh::AbstractLikelihood, xi, v) = fishermetric(lh, xi, v) .+ v
 
-struct _PosteriorMetricOperator{L, X}
-    lh::L
-    xi::X
+# The posterior-metric operator `v ↦ (I + Fisher)v` pins the likelihood at `xi` ONCE
+# (`_at_point`), so a CG solve reuses the forward-model linearization across all of its
+# matvecs instead of rebuilding it per application.
+struct _PosteriorMetricOperator{H}
+    h::H
 end
-(op::_PosteriorMetricOperator)(v) = _posterior_metric(op.lh, op.xi, v)
+_PosteriorMetricOperator(lh::AbstractLikelihood, xi) = _PosteriorMetricOperator(_at_point(lh, xi))
+(op::_PosteriorMetricOperator)(v) = fishermetric(op.h, v) .+ v
 
 struct MetricSample{M, P}
     metric::M
@@ -97,8 +123,8 @@ function draw_linear_residual(
         lh::AbstractLikelihood,
         xi,
         rng::AbstractRNG;
-        cg_rtol::Real = 1.0e-8,
-        cg_atol::Real = 0.0,
+        cg_rtol::Union{Nothing, Real} = 1.0e-8,
+        cg_atol::Union{Nothing, Real} = 0.0,
         cg_maxiter::Union{Nothing, Integer} = nothing,
         cg_miniter::Integer = 0,
         throw_on_failure::Bool = true,
@@ -120,8 +146,8 @@ function draw_linear_residual(
         lh::AbstractLikelihood,
         xi,
         metric_sample::MetricSample;
-        cg_rtol::Real = 1.0e-8,
-        cg_atol::Real = 0.0,
+        cg_rtol::Union{Nothing, Real} = 1.0e-8,
+        cg_atol::Union{Nothing, Real} = 0.0,
         cg_maxiter::Union{Nothing, Integer} = nothing,
         cg_miniter::Integer = 0,
         throw_on_failure::Bool = true,
@@ -145,8 +171,8 @@ function draw_linear_residual(
         xi,
         metric_sample;
         prior_sample = nothing,
-        cg_rtol::Real = 1.0e-8,
-        cg_atol::Real = 0.0,
+        cg_rtol::Union{Nothing, Real} = 1.0e-8,
+        cg_atol::Union{Nothing, Real} = 0.0,
         cg_maxiter::Union{Nothing, Integer} = nothing,
         cg_miniter::Integer = 0,
         throw_on_failure::Bool = true,

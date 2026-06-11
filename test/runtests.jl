@@ -221,6 +221,16 @@ end
         @test_throws ArgumentError MCEstimator(n_samples = 3, mirrored = true)
         @test GeoVI._n_base_draws(MCEstimator(n_samples = 5, mirrored = false)) == 5
 
+        # the estimator extension surface: the loop consults accessors, not fields,
+        # and a fieldless custom estimator gets a clear error naming what to implement.
+        @test GeoVI._n_stored_samples(est) == 6
+        @test GeoVI._mirrored(est)
+        @test GeoVI._n_stored_samples(MCEstimator()) == 4   # default is VI, not MAP
+        struct FieldlessEstimator <: GeoVI.AbstractEstimator end
+        @test_throws ArgumentError GeoVI._n_stored_samples(FieldlessEstimator())
+        @test_throws ArgumentError GeoVI._mirrored(FieldlessEstimator())
+        @test_throws ArgumentError GeoVI._n_base_draws(FieldlessEstimator())
+
         @test GeoVI._infer_adtype(GeoVI.ADTypes.AutoFiniteDiff(), [1.0, 2.0]) isa
             GeoVI.ADTypes.AutoFiniteDiff
         @test GeoVI._value_and_gradient(
@@ -251,11 +261,42 @@ end
 
         @test_throws ArgumentError update_nonlinear_residual(simple_lh, [0.0], [0.0])
         @test_throws ArgumentError VariationalProblem(
-            simple_lh, [0.0]; divergence = ForwardKL(), optimizer = NewtonCG()
+            simple_lh, [0.0]; divergence = GeoVI.ForwardKL(), optimizer = NewtonCG()
         )
         @test_throws ArgumentError VariationalProblem(
             simple_lh, [0.0]; divergence = ReverseKL(), optimizer = :adam
         )
+
+        # the positional constructor validates too (no bypass around _require_supported)
+        @test_throws ArgumentError VariationalProblem(
+            simple_lh, [0.0], MeanFieldGaussian(), ReverseKL(), MCEstimator(),
+            NewtonCG(), GeoVI.ADTypes.AutoFiniteDiff(),
+        )
+
+        # a structured-θ family with no samples must fail loudly at construction:
+        # the sample-free MAP objective is undefined off the latent point.
+        struct StructuredThetaFam <: GeoVI.AbstractVariationalFamily end
+        GeoVI.init_params(::StructuredThetaFam, x) = (; mean = copy(x))
+        @test_throws ArgumentError VariationalProblem(
+            simple_lh, [0.0]; family = StructuredThetaFam(),
+            estimator = MCEstimator(n_samples = 0), optimizer = Optimisers.Descent(0.1),
+        )
+
+        # initial Samples must not carry residuals (step_vi! redraws them, so they
+        # could never be used — rejected at construction)
+        @test_throws ArgumentError VariationalProblem(
+            simple_lh, Samples([0.0], reshape([0.25, -0.25], (2, 1)); keys = nothing);
+            family = MGVIFamily(),
+            estimator = MCEstimator(n_samples = 2), optimizer = NewtonCG(),
+        )
+        # a position-only Samples is fine, and the buffer starts zero-filled (no
+        # "residuals not yet drawn" state exists after init)
+        zerofill_problem = VariationalProblem(
+            simple_lh, Samples([0.0], nothing; keys = nothing); family = MGVIFamily(),
+            estimator = MCEstimator(n_samples = 2), optimizer = NewtonCG(),
+        )
+        _, zerofill_state = init(MersenneTwister(3), zerofill_problem)
+        @test zerofill_state.residuals == zeros(2, 1)
 
         nd_problem = VariationalProblem(
             simple_lh,
@@ -296,6 +337,30 @@ end
         @test info_ad.iterations < info_full.iterations
         @test info_ad.converged
         @test norm(op(x_ad) .- b) < norm(b)
+
+        # `nothing` tolerances mean "criterion absent": with only `atol` set the
+        # solve stops at that absolute residual norm.
+        x_nt, info_nt = GeoVI.solve(ConjugateGradient(rtol = nothing, atol = 1.0e-6), op, b)
+        @test info_nt.converged
+        @test norm(op(x_nt) .- b) <= 1.0e-5
+
+        # NewtonCG inner-CG tolerances: the default is `nothing` (pure
+        # Eisenstat–Walker forcing); explicit `cg_rtol` can only TIGHTEN the
+        # inner solve, so it must cost more CG iterations (counted in
+        # `hessian_evaluations`) on a single Newton step of a quadratic.
+        @test NewtonCG().cg.rtol === nothing
+        @test NewtonCG().cg.atol === nothing
+        quad_fg = x -> (0.5 * real(dot(x, op(x))) - real(dot(b, x)), op(x) .- b)
+        run_newton = opt -> GeoVI._optimize(
+            opt, zeros(D);
+            fun_and_grad = quad_fg, metricp = op,
+            GeoVI._optimizer_kwargs(opt)...,
+        )
+        res_forcing = run_newton(NewtonCG(maxiter = 1))
+        res_tight = run_newton(NewtonCG(maxiter = 1, cg_rtol = 1.0e-12, cg_maxiter = 500))
+        @test res_tight.hessian_evaluations > res_forcing.hessian_evaluations
+        # the tight inner solve lands (numerically) on the Newton point A⁻¹b
+        @test res_tight.x ≈ xstar atol = 1.0e-6 rtol = 1.0e-6
     end
 
     @testset "MGVI linear residuals" begin
@@ -598,7 +663,7 @@ end
         @test GeoVI._fdivergence_value(MGVIFamily(), ReverseKL(), lh, xi0, nothing) ≈
             GeoVI._negative_logposterior(lh, xi0)
         @test_throws ArgumentError GeoVI._fdivergence_value(
-            MGVIFamily(), ForwardKL(), lh, xi0, nothing
+            MGVIFamily(), GeoVI.ForwardKL(), lh, xi0, nothing
         )
     end
 
@@ -641,6 +706,71 @@ end
 
         # `step_vi!` (a fresh draw_samples!+update! per call) also converges.
         post = fit(geovi, 8; rng = MersenneTwister(9))
+        @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
+    end
+
+    @testset "linearization caching (perf regression)" begin
+        # A counting `linearize` measures how often the forward model is
+        # re-linearized. The cached `_at_point` handles must make constructions
+        # scale with (samples × Newton iterations), NOT with
+        # (samples × Newton iterations × CG matvecs).
+        D, M = 24, 16
+        setup = _linear_gaussian_setup(MersenneTwister(0xcafe); D = D, M = M, σ² = 0.25)
+        lin_count = Ref(0)
+        counting_linearize = x -> begin
+            lin_count[] += 1
+            (value = setup.A * x, pushforward = v -> setup.A * v, pullback = η -> setup.A' * η)
+        end
+        lh = compose(
+            GaussianLikelihood(setup.data; precision = setup.precision), ξ -> setup.A * ξ;
+            linearize = counting_linearize,
+        )
+
+        n_samples = 4
+        newton_maxiter = 3
+        problem = VariationalProblem(
+            lh, zeros(D);
+            family = MGVIFamily(solver = ConjugateGradient(rtol = 1.0e-10, maxiter = 100)),
+            estimator = MCEstimator(n_samples = n_samples, mirrored = true),
+            optimizer = NewtonCG(maxiter = newton_maxiter, xtol = 1.0e-9, cg_maxiter = 100),
+        )
+        rng, st = init(MersenneTwister(11), problem)
+
+        lin_count[] = 0
+        step_vi!(rng, problem, st)
+        # Calibrated (measured = budget, deterministic): the draw pins exactly 2 per
+        # base draw (metric-sample lift + the pinned CG operator); the update pins
+        # n_samples handles per Newton iteration (the field evaluated once per
+        # iteration). Line searches and CG matvecs pin nothing, so the count is
+        # bounded by the maxiters — uncached it would scale with CG matvecs,
+        # an order of magnitude larger.
+        n_base = n_samples ÷ 2
+        budget = 2 * n_base + newton_maxiter * n_samples
+        @test lin_count[] <= budget
+
+        # geoVI adds the nonlinear curve: still bounded by (curve Newton iters ×
+        # per-iteration pins), independent of CG iteration counts.
+        curve_maxiter = 4
+        geovi_problem = VariationalProblem(
+            lh, zeros(D);
+            family = GeoVIFamily(
+                solver = ConjugateGradient(rtol = 1.0e-10, maxiter = 100),
+                curve = NewtonCG(maxiter = curve_maxiter, cg_rtol = 1.0e-10, cg_maxiter = 100),
+            ),
+            estimator = MCEstimator(n_samples = n_samples, mirrored = true),
+            optimizer = NewtonCG(maxiter = newton_maxiter, xtol = 1.0e-9, cg_maxiter = 100),
+        )
+        rng_g, st_g = init(MersenneTwister(11), geovi_problem)
+        lin_count[] = 0
+        step_vi!(rng_g, geovi_problem, st_g)
+        # Calibrated (measured = budget, deterministic): the curve adds exactly 2 pins
+        # per curve-Newton iteration per base draw on top of the MGVI step; its line
+        # searches pin nothing.
+        curve_budget = budget + 2 * curve_maxiter * n_base
+        @test lin_count[] <= curve_budget
+
+        # And the fit still converges to the analytic posterior with caching on.
+        post = fit(problem, 6; rng = MersenneTwister(2))
         @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
     end
 
@@ -927,6 +1057,24 @@ end
             @test mf_post isa DiagonalGaussian
             @test Array(_post_mean(mf_post)) ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
             @test Array(exp.(mf_post.logstd)) ≈ Float32.(σ_expected) rtol = 0.35
+
+            # ── optimizer state must propagate across compiled step_vi! calls ──
+            # `update!` REASSIGNS `state.optimizer_state` (unlike `position`,
+            # which is written in place via `fmap(copyto!, ...)`). This guards
+            # that the updated Adam moments actually reach the host `VIState`
+            # between compiled calls instead of being silently frozen at zero —
+            # a failure the moment-recovery tolerances above would NOT catch.
+            rng_os, state_os = init(MersenneTwister(0x7777), mf_problem)
+            cstep_os = Reactant.@compile step_vi!(rng_os, mf_problem, state_os)
+            adam_m(s) = Array(s.optimizer_state.tree.mean.state[1])  # Adam 1st moment, mean leaf
+            m0 = adam_m(state_os)
+            @test all(iszero, m0)
+            cstep_os(rng_os, mf_problem, state_os)
+            m1 = adam_m(state_os)
+            cstep_os(rng_os, mf_problem, state_os)
+            m2 = adam_m(state_os)
+            @test any(!iszero, m1)   # momentum accumulated after the first step
+            @test m1 != m2           # and keeps advancing on the second
         end
     end
 end

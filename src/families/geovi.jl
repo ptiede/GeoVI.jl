@@ -3,18 +3,23 @@
 # Fisher-Gaussian machinery (`fisher_gaussian.jl`) and differs only in `_refine_residual`.
 
 """
-    GeoVIFamily(; solver=ConjugateGradient(), curve=NewtonCG())
+    GeoVIFamily(; solver=ConjugateGradient(), curve=NewtonCG(), strict=true)
 
 Geometric VI: a draw is an MGVI linear residual (`solver`) refined by a
 nonlinear coordinate "curve" obtained by minimizing the geoVI residual
 objective with `curve` (a [`NewtonCG`](@ref)). The curve is part of the *draw*,
-not the outer fit.
+not the outer fit. With `strict = true` (the default) a linear solve that fails
+to converge eagerly throws and aborts the fit; set `strict = false` to keep the
+unconverged draw and continue. (The curve itself never throws — an
+already-optimal residual that the curve cannot improve is not an error.)
 """
 struct GeoVIFamily{S, C} <: AbstractVariationalFamily
     solver::S
     curve::C
+    strict::Bool
 end
-GeoVIFamily(; solver = ConjugateGradient(), curve = NewtonCG()) = GeoVIFamily(solver, curve)
+GeoVIFamily(; solver = ConjugateGradient(), curve = NewtonCG(), strict = true) =
+    GeoVIFamily(solver, curve, strict)
 
 # The ONLY difference from MGVI: geoVI refines the linear residual with the nonlinear
 # curve. (`throw_on_failure = false`: re-transforming at a converged mean can leave the

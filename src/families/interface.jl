@@ -113,6 +113,50 @@ function natural_gradient_metric(
     )
 end
 
+# The metric comes in two layers, mirroring its geometry:
+#
+#   NaturalGradientField    — the metric *field* over θ-space: holds everything except the
+#                             base point. Evaluating it at a base point x (once per Newton
+#                             iteration) pins the field there, returning the operator on the
+#                             tangent space at x. This is the curried `metricp` the
+#                             optimizer contract consumes.
+#   NaturalGradientOperator — the field pinned at one base point: the linear map
+#                             `v ↦ (I + mean_i Fisher_i(base))·v` on the tangent space at
+#                             `base`, applied once per inner-CG matvec.
+#
+# Pinning goes through the `_natural_gradient_operator` hook so a family can cache
+# expensive per-base work (the Fisher-Gaussian families pin every sample point's
+# forward-model linearization there); the default below just closes over the 5-arg
+# `natural_gradient_metric`, re-deriving per application.
+
+struct NaturalGradientOperator{F, L, B, R}
+    family::F
+    likelihood::L
+    base::B
+    residuals::R
+end
+function (op::NaturalGradientOperator)(v)
+    return natural_gradient_metric(op.family, op.likelihood, op.base, op.residuals, v)
+end
+
+struct NaturalGradientField{F, L, R}
+    family::F
+    likelihood::L
+    residuals::R
+end
+function (field::NaturalGradientField)(base)
+    return _natural_gradient_operator(field.family, field.likelihood, base, field.residuals)
+end
+
+# The pinning hook, specialized by families that cache per-base work (see
+# `fisher_gaussian.jl`); the fallback operator re-derives the metric per matvec.
+function _natural_gradient_operator(
+        family::AbstractVariationalFamily, lh::AbstractLikelihood, base, residuals
+    )
+    return NaturalGradientOperator(family, lh, base, residuals)
+end
+
+
 # ── The fitted variational distribution ─────────────────────────────────────
 #
 # Fitting produces parameters θ; bound to its family (and likelihood) those parameters
@@ -157,17 +201,20 @@ function logdensity(d::AbstractVariationalDistribution, ξ)
     )
 end
 
+# Sizing template for batched `rand`: same shape/eltype as one draw, obtained WITHOUT
+# drawing (so `rand(rng, d, 0)` never advances the rng). Defaults to the distribution's
+# `mean` field; a distribution without one overrides `_sample_template`.
+_sample_template(d::AbstractVariationalDistribution) = d.mean
+
 # Shared: `n` independent draws stacked along a leading axis (each row a latent point).
-# Reuses the per-distribution `rand(rng, d)`; the first draw also fixes the output shape.
 Base.rand(d::AbstractVariationalDistribution) = rand(Random.default_rng(), d)
 Base.rand(d::AbstractVariationalDistribution, n::Integer) = rand(Random.default_rng(), d, n)
 function Base.rand(rng::AbstractRNG, d::AbstractVariationalDistribution, n::Integer)
     n >= 0 || throw(ArgumentError("`n` must be non-negative"))
-    first = rand(rng, d)
-    out = similar(first, (n, size(first)...))
-    trailing = ntuple(_ -> Colon(), ndims(first))
-    n >= 1 && (out[1, trailing...] = first)
-    @trace track_numbers = false for i in 2:n
+    template = _sample_template(d)
+    out = similar(template, (n, size(template)...))
+    trailing = ntuple(_ -> Colon(), ndims(template))
+    @trace track_numbers = false for i in 1:n
         out[i, trailing...] = rand(rng, d)
     end
     return out
