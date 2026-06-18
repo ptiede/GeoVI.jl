@@ -1,3 +1,10 @@
+# `likelihood` need NOT be an `AbstractLikelihood` — it may be any object (e.g. a plain
+# `Distributions.Distribution`) that implements the observation-space likelihood interface
+# (`logdensity`, `normalized_residual`, `transformation`, `leftsqrtmetric`, `rightsqrtmetric`,
+# and `fishermetric`) for the prediction `y`. The `ComposedLikelihood` wrapper itself IS an
+# `AbstractLikelihood`, so the rest of the VI machinery is unchanged; only the inner per-call
+# methods are forwarded to `likelihood`. This lets callers reuse an existing data-likelihood
+# type rather than wrapping it in a bespoke `AbstractLikelihood`.
 struct ComposedLikelihood{L, F, LIN, AD, AO} <: AbstractLikelihood
     likelihood::L
     forward::F
@@ -7,7 +14,7 @@ struct ComposedLikelihood{L, F, LIN, AD, AO} <: AbstractLikelihood
 end
 
 function ComposedLikelihood(
-        likelihood::AbstractLikelihood,
+        likelihood,
         forward;
         linearize = nothing,
         pushforward = nothing,
@@ -35,7 +42,7 @@ function ComposedLikelihood(
 end
 
 function compose(
-        lh::AbstractLikelihood,
+        lh,
         forward;
         linearize = nothing,
         pushforward = nothing,

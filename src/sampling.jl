@@ -27,7 +27,7 @@ _mirrored(e::AbstractEstimator) = _estimator_interface_error(e)
 _n_base_draws(e::AbstractEstimator) = _estimator_interface_error(e)
 
 """
-    MCEstimator(; n_samples=4, mirrored=true)
+    MCEstimator(; n_samples=8, mirrored=true)
 
 Plain Monte-Carlo estimator. `n_samples` is the number of stored sample nodes;
 with `mirrored=true` they are drawn as antithetic pairs (requires even
@@ -41,7 +41,7 @@ struct MCEstimator <: AbstractEstimator
     mirrored::Bool
 end
 
-function MCEstimator(; n_samples = 4, mirrored = true)
+function MCEstimator(; n_samples = 8, mirrored = true)
     n_samples >= 0 || throw(ArgumentError("`n_samples` must be non-negative"))
     mirrored && isodd(n_samples) &&
         throw(ArgumentError("mirrored sampling requires an even `n_samples`"))
@@ -93,8 +93,17 @@ space. The left square-root metric is (re-)applied at the current `xi`, so the s
 white noise yields a *consistent* metric sample at any expansion point — the metric is
 recomputed at the current mean each time `draw_samples!` runs.
 """
+# Metric-space white noise must have unit variance per REAL degree of freedom so that
+# `leftsqrtmetric(lh, xi, ·)` produces a metric sample with covariance exactly `F = JᵀMJ`.
+# `randn` on a COMPLEX tangent space (the visibility likelihood's `normalized_residual`) gives
+# variance ½ per real component (E|w|² = 1), so the complex case is rescaled by √2 to recover
+# the same convention the real-data path already satisfies. Without this the complex metric
+# sample is `F/2`, the draw covariance is mis-scaled, and posterior draws are under-dispersed.
+_unit_real_variance_white(w::AbstractArray{<:Complex}) = w .* sqrt(real(eltype(w))(2))
+_unit_real_variance_white(w::AbstractArray) = w
+
 function _metric_sample_from_white(lh::AbstractLikelihood, xi, metric_white, prior_white)
-    likelihood_sample = leftsqrtmetric(lh, xi, metric_white)
+    likelihood_sample = leftsqrtmetric(lh, xi, _unit_real_variance_white(metric_white))
     return MetricSample(likelihood_sample .+ prior_white, prior_white)
 end
 

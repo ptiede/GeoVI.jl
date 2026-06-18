@@ -54,7 +54,7 @@ function GeoVI._value_and_gradient(
         x::AbstractArray;
         fd_eps::Real = 1.0e-6,
     )
-    result = Enzyme.gradient(Enzyme.ReverseWithPrimal, objective, x)
+    result = Enzyme.gradient(Enzyme.ReverseWithPrimal, Enzyme.Const(objective), x)
     return result.val, result.derivs[1]
 end
 

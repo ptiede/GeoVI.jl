@@ -206,6 +206,15 @@ end
 # `mean` field; a distribution without one overrides `_sample_template`.
 _sample_template(d::AbstractVariationalDistribution) = d.mean
 
+"""
+    mean(d::AbstractVariationalDistribution)
+
+The variational mean of `q_θ` — the point estimate (the geoVI/MGVI expansion point μ, or
+the mean-field mean). Defaults to the distribution's `mean` field; a distribution that
+stores its mean elsewhere overrides this.
+"""
+Statistics.mean(d::AbstractVariationalDistribution) = d.mean
+
 # Shared: `n` independent draws stacked along a leading axis (each row a latent point).
 Base.rand(d::AbstractVariationalDistribution) = rand(Random.default_rng(), d)
 Base.rand(d::AbstractVariationalDistribution, n::Integer) = rand(Random.default_rng(), d, n)

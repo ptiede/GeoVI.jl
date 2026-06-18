@@ -225,7 +225,7 @@ end
         # and a fieldless custom estimator gets a clear error naming what to implement.
         @test GeoVI._n_stored_samples(est) == 6
         @test GeoVI._mirrored(est)
-        @test GeoVI._n_stored_samples(MCEstimator()) == 4   # default is VI, not MAP
+        @test GeoVI._n_stored_samples(MCEstimator()) == 8   # default is VI, not MAP
         struct FieldlessEstimator <: GeoVI.AbstractEstimator end
         @test_throws ArgumentError GeoVI._n_stored_samples(FieldlessEstimator())
         @test_throws ArgumentError GeoVI._mirrored(FieldlessEstimator())
@@ -345,22 +345,27 @@ end
         @test norm(op(x_nt) .- b) <= 1.0e-5
 
         # NewtonCG inner-CG tolerances: the default is `nothing` (pure
-        # Eisenstat–Walker forcing); explicit `cg_rtol` can only TIGHTEN the
-        # inner solve, so it must cost more CG iterations (counted in
-        # `hessian_evaluations`) on a single Newton step of a quadratic.
+        # Eisenstat–Walker forcing). Explicit `cg_rtol`/`cg_atol` act as a FLOOR on
+        # the inner residual target (a cap on tightness, guarding against
+        # over-solving near the optimum); they can only LOOSEN the inner solve, never
+        # tighten it below the forcing target.
         @test NewtonCG().cg.rtol === nothing
         @test NewtonCG().cg.atol === nothing
         quad_fg = x -> (0.5 * real(dot(x, op(x))) - real(dot(b, x)), op(x) .- b)
         run_newton = opt -> GeoVI._optimize(
             opt, zeros(D);
-            fun_and_grad = quad_fg, metricp = op,
+            fun_and_grad = quad_fg, metricp = (_ -> op),
             GeoVI._optimizer_kwargs(opt)...,
         )
         res_forcing = run_newton(NewtonCG(maxiter = 1))
+        # A `cg_rtol` below the forcing target is a no-op: it cannot tighten the inner
+        # solve, so a single Newton step costs the same inner matvecs as pure forcing.
         res_tight = run_newton(NewtonCG(maxiter = 1, cg_rtol = 1.0e-12, cg_maxiter = 500))
-        @test res_tight.hessian_evaluations > res_forcing.hessian_evaluations
-        # the tight inner solve lands (numerically) on the Newton point A⁻¹b
-        @test res_tight.x ≈ xstar atol = 1.0e-6 rtol = 1.0e-6
+        @test res_tight.hessian_evaluations == res_forcing.hessian_evaluations
+        # Forcing alone still drives the optimizer to the Newton point A⁻¹b: over
+        # successive steps ‖g‖→0 tightens the forcing until x lands on xstar.
+        res_converged = run_newton(NewtonCG(maxiter = 50))
+        @test res_converged.x ≈ xstar atol = 1.0e-6 rtol = 1.0e-6
     end
 
     @testset "MGVI linear residuals" begin

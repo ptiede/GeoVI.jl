@@ -33,10 +33,13 @@ Inexact Newton optimizer whose inner linear system is solved by conjugate
 gradient. The inner solve is governed by an Eisenstat–Walker forcing sequence:
 each Newton system is solved only as tightly as the current gradient warrants
 (residual target `min(0.5, √‖g‖)·‖g‖`). `cg_rtol`/`cg_atol` default to
-`nothing` (forcing alone); when set they can only *tighten* the inner solve —
-the threshold becomes `min(forcing, max(cg_atol, cg_rtol·‖g‖))`. To spend
-*less* inner effort, use `cg_maxiter` or the energy coupling below, not the
-tolerances.
+`nothing` (forcing alone); when set they act as a *floor* on the inner residual
+target — `threshold = max(forcing, max(cg_atol, cg_rtol·‖g‖))` — capping how
+tightly CG solves (a guard against over-solving near the optimum). They never
+*tighten* the forcing: setting `cg_rtol` will not force a tight inner solve far
+from the optimum (doing so via `min` was a large per-step regression). To spend
+*more* inner effort, lower `cg_rtol`; to spend *less*, raise it or use
+`cg_maxiter` / the energy coupling below.
 
 Energy-based convergence is opt-in via either `absdelta` (an absolute
 energy-decrease tolerance) or `delta` (the *per-degree-of-freedom* tolerance,
@@ -442,13 +445,18 @@ function _newton_cg_iter(
     # system only as tightly as the current gradient warrants. Far from the
     # optimum (large ‖g‖) CG stops early; near it (small ‖g‖) CG tightens.
     # Target residual norm = min(0.5, √‖g‖) · ‖g‖  (cf. NIFTy.re / SciPy).
-    # Explicit `cg_rtol`/`cg_atol` (default `nothing`) can only TIGHTEN this:
-    # threshold = min(forcing, max(cg_atol, cg_rtol·‖g‖)). The `=== nothing`
-    # checks are host-side type checks on the config struct, never traced.
+    # Explicit `cg_rtol`/`cg_atol` (default `nothing`) act as a FLOOR on the inner
+    # residual target — they cap how tightly CG solves (a guard against
+    # over-solving near the optimum), they do NOT tighten the Eisenstat–Walker
+    # forcing: threshold = max(forcing, max(cg_atol, cg_rtol·‖g‖)). Folding them in
+    # with `min` (tightening every iteration) forced a 0.1%-relative inner solve on
+    # every Newton step — including far from the optimum where forcing alone allows
+    # up to 50% — and was a ~12× per-step regression on the geoVI curve. The
+    # `=== nothing` checks are host-side type checks on the config struct, never traced.
     gnorm = norm(grad)
     forcing = min(one(gnorm) / 2, sqrt(gnorm)) * gnorm
     if cg.rtol !== nothing || cg.atol !== nothing
-        forcing = min(forcing, max(_tol_or_zero(cg.atol), _tol_or_zero(cg.rtol) * gnorm))
+        forcing = max(forcing, max(_tol_or_zero(cg.atol), _tol_or_zero(cg.rtol) * gnorm))
     end
     # NIFTy.re energy-decrease coupling, applied ONLY when the optimizer carries
     # an `absdelta` (calibrated, e.g. via a `delta`-by-size convenience). The

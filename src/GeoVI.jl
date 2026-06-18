@@ -7,6 +7,7 @@ using LogExpFunctions: log1pexp, logistic
 using Optimisers
 using Random
 using ReactantCore
+import Statistics
 
 export randn_like
 export AbstractLikelihood,

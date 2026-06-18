@@ -177,7 +177,14 @@ end
 
 function solve(cg::ConjugateGradient, operator, b; x0 = nothing, threshold = nothing, absdelta = nothing)
     miniter = cg.miniter
-    maxiter = cg.maxiter === nothing ? max(20, 2 * length(b)) : cg.maxiter
+    # Default iteration cap when `maxiter` is unset, matching NIFTy.re's `_cg`
+    # (conjugate_gradient.py): `maxiter = max(min(200, 20·D), miniter)`. ONE cap for both
+    # the plain residual draw and the inexact-Newton forcing solve — NIFTy drives both
+    # through the same `_cg`. 200 is ample once the system is preconditioned/converging;
+    # on an ill-conditioned draw it bounds the work (and, under `strict`, the failure)
+    # instead of grinding toward ~2·D (~18k at D≈9k). `threshold` still selects the
+    # forcing stop criterion below; it no longer scopes the iteration cap.
+    maxiter = cg.maxiter === nothing ? max(miniter, min(200, 20 * length(b))) : cg.maxiter
     # An explicit `threshold` (e.g. an Eisenstat–Walker forcing term from the
     # Newton-CG outer loop) overrides the static `atol`/`rtol` criterion.
     thr = threshold === nothing ? max(_tol_or_zero(cg.atol), _tol_or_zero(cg.rtol) * norm(b)) : threshold

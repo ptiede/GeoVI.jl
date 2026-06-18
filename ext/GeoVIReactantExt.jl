@@ -101,8 +101,10 @@ struct _ReactantLinearization{F, X, V}
 end
 
 function GeoVI.pushforward(lin::_ReactantLinearization, v::AbstractArray)
-    dres, _ = Reactant.Enzyme.autodiff(
-        Reactant.Enzyme.ForwardWithPrimal,
+    # `Forward` and `ForwardWithPrimal` produce the identical JVP; the latter only additionally
+    # returns the primal (which we discard), so the choice is irrelevant to the tangent.
+    (dres,) = Reactant.Enzyme.autodiff(
+        Reactant.Enzyme.Forward,
         lin.forward,
         Reactant.Enzyme.Duplicated,
         Reactant.Enzyme.Duplicated(lin.x, v),
@@ -181,7 +183,7 @@ function GeoVI._value_and_gradient(
         x;
         fd_eps = 1.0e-6,
     )
-    result = Reactant.Enzyme.gradient(Reactant.Enzyme.ReverseWithPrimal, objective, x)
+    result = Reactant.Enzyme.gradient(Reactant.Enzyme.ReverseWithPrimal, Reactant.Enzyme.Const(objective), x)
     return result.val, result.derivs[1]
 end
 
