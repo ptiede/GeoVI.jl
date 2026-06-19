@@ -16,14 +16,40 @@ to build `θ` and the latent point to size buffers.
 
 ### A. `init` gains an optional latent point (allocates)
 
+The rng is **first-positional or auto-generated — never a keyword** (per the
+project convention). This *replaces* the existing `init(problem; rng=...)`
+keyword method with an auto-generating `init(problem)`:
+
 ```julia
-init(rng, problem, ξ0)        # rng-first positional (API convention)
-init(problem, ξ0; rng=...)
-init(rng, problem)            # unchanged
-init(problem; rng=...)        # unchanged
+init(problem)                 # auto rng: Random.default_rng()
+init(rng, problem)            # rng first
+init(problem, ξ0)             # auto rng, new starting point
+init(rng, problem, ξ0)        # rng first, new starting point
 ```
 
-The only change in the body is selecting the latent point:
+`ξ0` is the **starting latent point** — for MGVI/geoVI the mean the optimizer
+starts from, for mean-field the seed for `(; mean=ξ0, logstd=0)`. So these forms
+are how the user specifies a new starting position without rebuilding the
+problem.
+
+In-repo only `fit` calls `init`, and it does so positionally
+(`init(rng, problem)`), so dropping the keyword method breaks nothing internally.
+
+`fit` gets the same treatment — rng first-positional or auto, no keyword:
+
+```julia
+fit(problem, n)               # auto rng: Random.default_rng()
+fit(rng, problem, n)          # rng first (already exists)
+```
+
+The keyword method `fit(problem, n; rng=...)` is replaced by the auto-generating
+`fit(problem, n)`. This churns the call sites that pass `rng = …`:
+`test/runtests.jl` (lines ~310, 596, 628, 642, 713, 778, 808) and
+`docs/src/design.md` (~282), plus the prose mentions of `fit(problem, n; rng)` in
+`docs/src/interfaces.md` and `docs/src/design.md`. Each `fit(p, n; rng = R)`
+becomes `fit(R, p, n)`.
+
+The only change in the allocating body is selecting the latent point:
 
 ```julia
 latent = something(ξ0, problem.initial_samples.position)
@@ -87,7 +113,13 @@ runs, not inside the compiled step.
 ## Exports
 
 Add `reset!` to the VI-loop export block in `src/GeoVI.jl` (next to `init`,
-`step_vi!`, `fit`). `init`'s new method needs no export change.
+`step_vi!`, `fit`). The new `init`/`fit` positional methods need no export change.
+
+## Docstring updates
+
+Update the `init` docstring (`init([rng], problem[, ξ0]) -> (rng, state)`) and the
+`fit` docstring to drop the `; rng` keyword form and document the optional `ξ0`
+starting point. Add a `reset!` docstring.
 
 ## Testing
 
@@ -110,4 +142,5 @@ Add `reset!` to the VI-loop export block in `src/GeoVI.jl` (next to `init`,
 
 - Preserving optimizer momentum across a reset (explicitly rejected above).
 - Resizing buffers in `reset!` (use allocating `init`).
-- Any change to `step_vi!`, `fit`, or the four-axis problem construction.
+- Any change to `step_vi!` or the four-axis problem construction. (`fit` and
+  `init` lose only their `rng` *keyword*; their behavior is otherwise unchanged.)
