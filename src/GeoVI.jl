@@ -6,6 +6,7 @@ using LinearAlgebra
 using LogExpFunctions: log1pexp, logistic
 using Optimisers
 using Random
+using PSIS
 using ReactantCore
 import Statistics
 
@@ -29,7 +30,7 @@ export AbstractLikelihood,
     compose
 export Samples, posterior_samples, recenter
 export AbstractVariationalDistribution, DiagonalGaussian, FisherGaussianDistribution, distribution
-export logdensity_unnormalized, log_importance_ratio
+export logdensity_unnormalized, log_importance_ratio, pareto_diagnostic
 export MetricSample,
     ConjugateGradientInfo,
     ConjugateGradient,
@@ -72,5 +73,6 @@ include("families/fisher_gaussian.jl")
 include("families/meanfield.jl")
 include("vi.jl")
 include("nonlinear.jl")
+include("psis.jl")
 
 end

@@ -1032,6 +1032,41 @@ end
         @test !all(≈(lrs_off[1]; atol = 1.0e-6), lrs_off)
     end
 
+    @testset "pareto_diagnostic" begin
+        rng = MersenneTwister(2024)
+
+        # Shift invariance: adding a constant to every log-ratio (the dropped ½logdet(I+F))
+        # leaves k̂ and the normalized weights unchanged. This is exactly why the unnormalized
+        # log q suffices.
+        lr = randn(rng, 2000)
+        a = pareto_diagnostic(lr)
+        b = pareto_diagnostic(lr .+ 12.5)
+        @test a.pareto_shape ≈ b.pareto_shape atol = 1.0e-10
+        @test a.weights ≈ b.weights atol = 1.0e-10
+        @test sum(a.weights) ≈ 1.0
+        @test length(a.weights) == 2000
+
+        # Heavier-tailed weights ⇒ larger k̂ than light-tailed ones.
+        light = pareto_diagnostic(0.3 .* randn(MersenneTwister(1), 3000))
+        heavy = pareto_diagnostic(5.0 .* randn(MersenneTwister(1), 3000))
+        @test heavy.pareto_shape > light.pareto_shape
+
+        # Convenience method: draw from an off-center linear-Gaussian proposal (q ≠ p, so the
+        # ratios genuinely vary) and run PSIS end-to-end.
+        precision = [3.0, 5.0]
+        data = [1.5, -0.5]
+        base = GaussianLikelihood(data; precision = precision)
+        A = [1.0 2.0; -1.0 0.5]
+        lh = compose(base, x -> A * x; pushforward = (x, v) -> A * v, pullback = (x, η) -> A' * η)
+        P = Diagonal(precision)
+        μstar = (I + A' * P * A) \ (A' * P * data)
+        d_off = distribution(MGVIFamily(), μstar .+ [0.5, 0.5], lh)
+        res = pareto_diagnostic(MersenneTwister(7), d_off, 800)
+        @test res.pareto_shape isa Real && isfinite(res.pareto_shape)
+        @test length(res.weights) == 800
+        @test sum(res.weights) ≈ 1.0
+    end
+
     @testset "Reactant extension" begin
         if !HAS_REACTANT
             @info "Skipping Reactant tests because `Reactant` is not available in the active environment."
