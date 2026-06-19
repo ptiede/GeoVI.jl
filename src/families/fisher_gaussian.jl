@@ -141,3 +141,15 @@ function logdensity_unnormalized(d::FisherGaussianDistribution, ξ)
     δ = ξ .- d.mean
     return -0.5 * real(dot(δ, _posterior_metric(d.likelihood, d.mean, δ)))
 end
+
+"""
+    log_importance_ratio(d::FisherGaussianDistribution, ξ) -> Real
+
+`log p(ξ) − log q(ξ)` up to the constant that [`logdensity_unnormalized`](@ref) drops.
+`p` is the (standardized) posterior carried by `d.likelihood`; `q` is the variational
+distribution. A pure scalar over the likelihood, so it compiles under Reactant — the
+per-sample log-weight for [`pareto_diagnostic`](@ref). The dropped constant cancels in
+`k̂` and in self-normalized reweighting, so this unnormalized form is exact for both.
+"""
+log_importance_ratio(d::FisherGaussianDistribution, ξ) =
+    -_negative_logposterior(d.likelihood, ξ) - logdensity_unnormalized(d, ξ)

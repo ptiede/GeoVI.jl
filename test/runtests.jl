@@ -1007,6 +1007,31 @@ end
         @test logdensity_unnormalized(dg, [0.4, 0.4]) == logdensity(dg, [0.4, 0.4])
     end
 
+    @testset "log_importance_ratio" begin
+        precision = [3.0, 5.0]
+        data = [1.5, -0.5]
+        base = GaussianLikelihood(data; precision = precision)
+        A = [1.0 2.0; -1.0 0.5]
+        lh = compose(base, x -> A * x; pushforward = (x, v) -> A * v, pullback = (x, η) -> A' * η)
+
+        # Linear-Gaussian + standard-normal prior ⇒ the posterior is exactly
+        # N(μ*, (I+F)⁻¹). Build q at the true posterior mean μ*, so q == p EXACTLY and the
+        # log importance ratio log p − log q is CONSTANT across ξ (the cancelling normalizer).
+        P = Diagonal(precision)
+        M = I + A' * P * A
+        μstar = M \ (A' * P * data)
+        d = distribution(MGVIFamily(), μstar, lh)
+
+        ξs = ([0.0, 0.0], [0.5, -0.3], [-1.2, 2.1], μstar .+ [0.7, -0.9])
+        lrs = [log_importance_ratio(d, ξ) for ξ in ξs]
+        @test all(≈(lrs[1]; atol = 1.0e-9), lrs)   # exactly constant ⇒ perfect proposal
+
+        # Off-center proposal ⇒ q ≠ p ⇒ the ratio genuinely varies with ξ.
+        d_off = distribution(MGVIFamily(), μstar .+ [0.5, 0.5], lh)
+        lrs_off = [log_importance_ratio(d_off, ξ) for ξ in ξs]
+        @test !all(≈(lrs_off[1]; atol = 1.0e-6), lrs_off)
+    end
+
     @testset "Reactant extension" begin
         if !HAS_REACTANT
             @info "Skipping Reactant tests because `Reactant` is not available in the active environment."
