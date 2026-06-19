@@ -29,7 +29,7 @@ export AbstractLikelihood,
     compose
 export Samples, posterior_samples, recenter
 export AbstractVariationalDistribution, DiagonalGaussian, FisherGaussianDistribution, distribution
-export logdensity_unnormalized
+export logdensity_unnormalized, log_importance_ratio
 export MetricSample,
     ConjugateGradientInfo,
     ConjugateGradient,
