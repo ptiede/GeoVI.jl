@@ -80,10 +80,18 @@ identity:
    the mean-field NamedTuple `θ`).
 2. `fill!(state.residuals, 0)` when `state.residuals !== nothing` (matches a
    fresh `init`; the buffer is redrawn at the start of every `step_vi!` anyway).
-3. Reset the optimizer state to a fresh `_init_optimizer_state(problem, state.position)`,
-   copied into the existing `state.optimizer_state` in place
-   (`fmap(copyto!, …)`) so array identity is preserved. `NewtonCG`'s state is
-   `nothing`, so that case is a no-op.
+3. Reassign the optimizer state to a fresh
+   `_init_optimizer_state(problem, state.position)`
+   (`state.optimizer_state = …`). This mirrors `update!` (`src/vi.jl`), which
+   reassigns `state.optimizer_state` every step *inside* the compiled region — so
+   Reactant does not rely on the optimizer state's buffer identity (unlike
+   `position`/`residuals`, which `update!`/`draw_samples!` mutate in place and
+   whose identity reset! therefore preserves). `NewtonCG`'s state is `nothing`,
+   so this reassigns `nothing`.
+
+   (An in-place `fmap(copyto!, …)` is *not* usable here: an `Optimisers` state
+   tree has non-array leaves — e.g. Adam's `βt` is a float tuple — and `copyto!`
+   on a scalar throws.)
 
 `reset!` returns `state`.
 
@@ -129,8 +137,10 @@ starting point. Add a `reset!` docstring.
 - `init(rng, problem)` (no `ξ0`) is unchanged — equal to the previous behavior.
 - `reset!(state, problem, ξ0)` mutates `state` in place: returns the same object,
   `state.position` derives from `ξ0`, residuals are zeroed, optimizer state is
-  fresh. Assert array identities (`===`) of `state.residuals` and the optimizer
-  state's leaves are preserved across the call.
+  fresh (momentum zeroed). Assert array identity (`===`) of `state.position` and
+  `state.residuals` is preserved across the call (the Reactant-critical buffers).
+  The optimizer state is *reassigned* (fresh), so its identity is not preserved —
+  assert it is freshly zeroed instead.
 - `reset!` with a wrong-sized `ξ0` errors clearly.
 - A short end-to-end check: fit, `reset!` to a new point, fit again, and confirm
   the second run starts from the reset point.
