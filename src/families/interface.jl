@@ -201,6 +201,17 @@ function logdensity(d::AbstractVariationalDistribution, ξ)
     )
 end
 
+"""
+    logdensity_unnormalized(d::AbstractVariationalDistribution, ξ) -> Real
+
+The variational log-density `log q(ξ)` up to an additive constant that is the same for
+every draw from `d`. For families with a tractable normalized density this is just
+[`logdensity`](@ref); the Fisher-Gaussian families override it with the metric-Gaussian
+form whose intractable `½logdet(I+F)` normalization is dropped (it cancels in any
+ratio of weights from the same `d` — see [`pareto_diagnostic`](@ref)).
+"""
+logdensity_unnormalized(d::AbstractVariationalDistribution, ξ) = logdensity(d, ξ)
+
 # Sizing template for batched `rand`: same shape/eltype as one draw, obtained WITHOUT
 # drawing (so `rand(rng, d, 0)` never advances the rng). Defaults to the distribution's
 # `mean` field; a distribution without one overrides `_sample_template`.

@@ -986,6 +986,27 @@ end
         @test size(draws) == (64, D)
     end
 
+    @testset "logdensity_unnormalized" begin
+        precision = [3.0, 5.0]
+        base = GaussianLikelihood([1.5, -0.5]; precision = precision)
+        A = [1.0 2.0; -1.0 0.5]
+        lh = compose(base, x -> A * x; pushforward = (x, v) -> A * v, pullback = (x, η) -> A' * η)
+
+        μ = [0.2, -0.1]
+        d = distribution(MGVIFamily(), μ, lh)
+        M = I + A' * Diagonal(precision) * A    # (I + Fisher) at the mean
+
+        # Exact metric-Gaussian log-density up to the cancelling constant.
+        for ξ in ([0.0, 0.0], [0.3, 0.4], [-1.0, 2.0])
+            δ = ξ .- μ
+            @test logdensity_unnormalized(d, ξ) ≈ -0.5 * dot(δ, M * δ) atol = 1.0e-10
+        end
+
+        # Generic fallback delegates to the tractable mean-field density.
+        dg = distribution(MeanFieldGaussian(), (; mean = [0.1, -0.2], logstd = [0.0, 0.5]), lh)
+        @test logdensity_unnormalized(dg, [0.4, 0.4]) == logdensity(dg, [0.4, 0.4])
+    end
+
     @testset "Reactant extension" begin
         if !HAS_REACTANT
             @info "Skipping Reactant tests because `Reactant` is not available in the active environment."

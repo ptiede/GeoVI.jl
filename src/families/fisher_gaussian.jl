@@ -104,7 +104,9 @@ end
 # A draw is a CG solve against the posterior Fisher at the mean (geoVI adds the curve), so
 # the distribution must carry the family (solver/curve) and the likelihood. Its `rand`
 # reuses the same draw pipeline as a fit step (one base draw → `transport_and_logjac`).
-# There is no `logdensity(q, ξ)` (the normalization is an intractable log-determinant).
+# There is no normalized `logdensity(q, ξ)` (the normalization is an intractable
+# log-determinant), but `logdensity_unnormalized` IS available: the metric-Gaussian
+# log-density minus that constant, which is all `pareto_diagnostic` needs.
 
 struct FisherGaussianDistribution{F <: FisherGaussian, V, L} <: AbstractVariationalDistribution
     family::F
@@ -122,4 +124,20 @@ function Base.rand(rng::AbstractRNG, d::FisherGaussianDistribution)
     linear = draw_linear_residual(lh, μ, ms; _draw_linear_kwargs(fam)...)
     block = _refine_residual(fam, lh, μ, linear, ms, false)
     return first(transport_and_logjac(fam, μ, _sample_slice(block, 1)))
+end
+
+"""
+    logdensity_unnormalized(d::FisherGaussianDistribution, ξ) -> Real
+
+`log q(ξ) = -½ (ξ-μ)ᵀ (I+F(μ)) (ξ-μ)` — the metric-Gaussian log-density up to the
+sample-independent `½logdet(I+F(μ))` constant. One `_posterior_metric` matvec.
+
+EXACT for MGVI (the proposal is exactly `N(μ, (I+F(μ))⁻¹)`). For geoVI the draw bends each
+sample through a per-sample nonlinear curve, so this is the underlying metric-Gaussian's
+log-density (the curve Jacobian is dropped) — an approximate, but well-defined and
+documented, diagnostic density.
+"""
+function logdensity_unnormalized(d::FisherGaussianDistribution, ξ)
+    δ = ξ .- d.mean
+    return -0.5 * real(dot(δ, _posterior_metric(d.likelihood, d.mean, δ)))
 end
