@@ -307,7 +307,7 @@ end
             optimizer = NewtonCG(),
             adtype = GeoVI.ADTypes.NoAutoDiff(),
         )
-        @test_throws ArgumentError fit(nd_problem, 1; rng = MersenneTwister(1))
+        @test_throws ArgumentError fit(MersenneTwister(1), nd_problem, 1)
     end
 
     @testset "conjugate gradient stopping" begin
@@ -593,7 +593,7 @@ end
         @test distribution(mgvi_problem, step_state) isa FisherGaussianDistribution
 
         # fit returns the fitted variational distribution
-        mgvi_post = fit(mgvi_problem, 3; rng = MersenneTwister(5))
+        mgvi_post = fit(MersenneTwister(5), mgvi_problem, 3)
         @test mgvi_post isa AbstractVariationalDistribution
         @test _post_mean(mgvi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
         @test size(rand(MersenneTwister(7), mgvi_post, 8)) == (8, 1)   # draw fresh samples
@@ -625,7 +625,7 @@ end
         rng_g, geovi_state = init(MersenneTwister(5), geovi_problem)
         step_vi!(rng_g, geovi_problem, geovi_state)
         @test geovi_problem.family isa GeoVIFamily
-        geovi_post = fit(geovi_problem, 3; rng = MersenneTwister(5))
+        geovi_post = fit(MersenneTwister(5), geovi_problem, 3)
         @test _post_mean(geovi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
 
         # A bare Optimisers rule is the outer optimizer: each step_vi! takes one
@@ -639,7 +639,7 @@ end
             estimator = MCEstimator(n_samples = 0),
             optimizer = Optimisers.Adam(0.05),
         )
-        adam_post = fit(adam_problem, 400; rng = MersenneTwister(11))
+        adam_post = fit(MersenneTwister(11), adam_problem, 400)
         @test _post_mean(adam_post) ≈ analytic_mean atol = 1.0e-2 rtol = 0.0
 
         # Adam optimizer state persists across steps: two steps (carrying
@@ -771,7 +771,7 @@ end
         @test _post_mean(distribution(geovi, s2)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
 
         # `step_vi!` (a fresh draw_samples!+update! per call) also converges.
-        post = fit(geovi, 8; rng = MersenneTwister(9))
+        post = fit(MersenneTwister(9), geovi, 8)
         @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
     end
 
@@ -836,7 +836,7 @@ end
         @test lin_count[] <= curve_budget
 
         # And the fit still converges to the analytic posterior with caching on.
-        post = fit(problem, 6; rng = MersenneTwister(2))
+        post = fit(MersenneTwister(2), problem, 6)
         @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
     end
 
@@ -866,7 +866,7 @@ end
                 estimator = est,
                 optimizer = outer,
             )
-            post = fit(problem, 8; rng = MersenneTwister(2025))
+            post = fit(MersenneTwister(2025), problem, 8)
             @test _post_mean(post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
 
             # `rand` from the fitted distribution recovers the posterior moments.
@@ -897,7 +897,7 @@ end
             estimator = est,
             optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, absdelta = ad, cg_rtol = 1.0e-10, cg_maxiter = 200),
         )
-        coupled_post = fit(coupled_problem, 8; rng = MersenneTwister(2025))
+        coupled_post = fit(MersenneTwister(2025), coupled_problem, 8)
         @test _post_mean(coupled_post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
 
         # The `delta` convenience (per-d.o.f. tolerance) must be exactly
@@ -915,7 +915,7 @@ end
             estimator = est,
             optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, delta = delta, cg_rtol = 1.0e-10, cg_maxiter = 200),
         )
-        delta_post = fit(delta_problem, 8; rng = MersenneTwister(2025))
+        delta_post = fit(MersenneTwister(2025), delta_problem, 8)
         @test _post_mean(delta_post) ≈ _post_mean(coupled_post) atol = 1.0e-12 rtol = 1.0e-12
     end
 
@@ -965,7 +965,7 @@ end
         @test st.residuals isa AbstractArray
         @test size(st.residuals) == (128, D)
 
-        post = fit(mf, 3000; rng = MersenneTwister(0xfeed))
+        post = fit(MersenneTwister(0xfeed), mf, 3000)
         # Mean-field recovers the exact posterior mean; its marginal σ is the
         # inverse-sqrt of the posterior PRECISION diagonal (it underestimates the
         # true marginal variance — a known property of mean-field).
@@ -1039,7 +1039,7 @@ end
         @test st.position isa NamedTuple && keys(st.position) == (:mean, :logs)
         @test st.residuals isa AbstractArray && size(st.residuals) == (64, D)
 
-        post = fit(problem, 3000; rng = MersenneTwister(0x01))
+        post = fit(MersenneTwister(0x01), problem, 3000)
         @test post isa ScalarScaleDist
         @test post.mean ≈ setup.μ_post atol = 0.05 rtol = 0.0
         # draw fresh samples from the fitted custom distribution
@@ -1163,7 +1163,7 @@ end
 
             # `fit` compiles `step_vi!` once (via `_run_vi!(::AutoReactant,...)`)
             # and loops the compiled thunk.
-            post = fit(problem, 8; rng = MersenneTwister(0xfeed))
+            post = fit(MersenneTwister(0xfeed), problem, 8)
             @test post isa FisherGaussianDistribution
             position_host = Array(_post_mean(post))
             @test position_host ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
@@ -1199,7 +1199,7 @@ end
             @test state_mf.position isa NamedTuple   # generic θ container under Reactant
             @test keys(state_mf.position) == (:mean, :logstd)
 
-            mf_post = fit(mf_problem, 3000; rng = MersenneTwister(0xabcd))
+            mf_post = fit(MersenneTwister(0xabcd), mf_problem, 3000)
             σ_expected = 1 ./ sqrt.(diag(I + setup.A' * Diagonal(setup.precision) * setup.A))
             @test mf_post isa DiagonalGaussian
             @test Array(_post_mean(mf_post)) ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0

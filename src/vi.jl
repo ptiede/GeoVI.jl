@@ -576,8 +576,8 @@ function fit(rng::AbstractRNG, problem::VariationalProblem, n_iterations::Intege
     return distribution(problem, state)
 end
 
-fit(problem::VariationalProblem, n_iterations::Integer; rng::AbstractRNG = Random.default_rng()) =
-    fit(rng, problem, n_iterations)
+fit(problem::VariationalProblem, n_iterations::Integer) =
+    fit(Random.default_rng(), problem, n_iterations)
 
 """
     distribution(problem, state::VIState) -> AbstractVariationalDistribution
