@@ -42,7 +42,7 @@ Everything else *follows* from the cut: the reverse-KL objective is `mean_i[-log
 
 3. **Nonlinear update** (`src/nonlinear.jl`) — Refines linear residuals via Newton-CG or gradient-based optimizers. `NewtonCG` is the recommended optimizer for the inner loop.
 
-4. **Outer VI loop** (`src/vi.jl`) — Coordinates sampling and position optimization, organized as four orthogonal axes (see "Key types"). The primary interface is the in-place loop: `rng, state = init(rng, problem)` then `step_vi!(rng, problem, state)` per iteration, which mutates the one `VIState` and its buffers in place (the user owns the loop, Optimisers.jl-style; `problem` and `rng` are passed in, not stored in the state). `fit(problem, n; rng)` is a convenience that runs `n` iterations and returns the fitted variational distribution (`distribution(problem, state)`, an `AbstractVariationalDistribution`). Under Reactant `step_vi!` is a pure in-place mutation with no host-only state, so the user `@compile`s it themselves and loops the compiled thunk (`fit` does this for you: it compiles `step_vi!` once via `_run_vi!`, then loops the thunk on the host). A VI step is the **`draw → optimize-against-fixed-samples → resample` loop** (the same one NIFTy's `OptimizeVI.update` runs), sliced into **two phases** (`src/vi.jl`, unexported primitives the user can compose): `GeoVI.draw_samples!` (the only stochastic, `rng`-using phase — fill `state.residuals` with the MC set drawn at the current mean: pushforward = IID white noise, MGVI = CG solve, geoVI = CG + curve), then `GeoVI.update!` (estimate the KL with that fixed set and move the variational parameters — one `Optimisers` step, or `NewtonCG` to convergence). `step_vi!` = `draw_samples!`→`update!`; a custom loop calls the two phases directly. The white noise the draw consumes is transient scratch allocated inside `draw_samples!` (the built-ins bulk-draw it before their `@trace` loop, though rng use inside a traced loop is also fine), not stored in `VIState` — the state holds only `position`, the latent-shaped `residuals` buffer, and `optimizer_state`.
+4. **Outer VI loop** (`src/vi.jl`) — Coordinates sampling and position optimization, organized as four orthogonal axes (see "Key types"). The primary interface is the in-place loop: `rng, state = init(rng, problem)` then `step_vi!(rng, problem, state)` per iteration, which mutates the one `VIState` and its buffers in place (the user owns the loop, Optimisers.jl-style; `problem` and `rng` are passed in, not stored in the state). `fit([rng], problem, n)` is a convenience that runs `n` iterations and returns the fitted variational distribution (`distribution(problem, state)`, an `AbstractVariationalDistribution`) (rng positional or auto). Under Reactant `step_vi!` is a pure in-place mutation with no host-only state, so the user `@compile`s it themselves and loops the compiled thunk (`fit` does this for you: it compiles `step_vi!` once via `_run_vi!`, then loops the thunk on the host). A VI step is the **`draw → optimize-against-fixed-samples → resample` loop** (the same one NIFTy's `OptimizeVI.update` runs), sliced into **two phases** (`src/vi.jl`, unexported primitives the user can compose): `GeoVI.draw_samples!` (the only stochastic, `rng`-using phase — fill `state.residuals` with the MC set drawn at the current mean: pushforward = IID white noise, MGVI = CG solve, geoVI = CG + curve), then `GeoVI.update!` (estimate the KL with that fixed set and move the variational parameters — one `Optimisers` step, or `NewtonCG` to convergence). `step_vi!` = `draw_samples!`→`update!`; a custom loop calls the two phases directly. The white noise the draw consumes is transient scratch allocated inside `draw_samples!` (the built-ins bulk-draw it before their `@trace` loop, though rng use inside a traced loop is also fine), not stored in `VIState` — the state holds only `position`, the latent-shaped `residuals` buffer, and `optimizer_state`.
 
 5. **AD/compilation extensions** (`ext/`) —
    - `GeoVIEnzymeExt.jl` provides `pushforward`/`_value_and_gradient` via Enzyme (`AutoEnzyme`).
@@ -106,7 +106,10 @@ end
 q = distribution(problem, state)
 
 # or the convenience driver:
-q = fit(problem, 8; rng=MersenneTwister(42))
+q = fit(MersenneTwister(42), problem, 8)
+
+# restart from a new point without rebuilding `problem`:
+rng, state = init(MersenneTwister(42), problem, xi0_new)   # or: reset!(state, problem, xi0_new)
 
 draws = rand(MersenneTwister(0), q, 100)      # draw arbitrarily many new samples
 μ     = q.mean                                # the latent mean
@@ -122,7 +125,7 @@ problem = VariationalProblem(lh, xi0;
     estimator = MCEstimator(; n_samples=128, mirrored=true),
     optimizer = Optimisers.Adam(0.05),     # required: a bare Optimisers rule
 )                                          # adtype defaults to AutoFiniteDiff (tree-generic via destructure)
-q = fit(problem, 3000; rng=MersenneTwister(0))
+q = fit(MersenneTwister(0), problem, 3000)
 σ    = exp.(q.logstd)                      # recovered marginal std devs
 ```
 

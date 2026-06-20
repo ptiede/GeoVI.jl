@@ -227,9 +227,11 @@ end
 q = distribution(problem, state)
 ```
 
-`fit(problem, n; rng)` is a convenience that runs the loop and returns the fitted
-variational distribution. `VariationalProblem` resolves the AD backend once (e.g.
-inferring `AutoReactant` from a Reactant array position).
+`fit([rng], problem, n)` is a convenience that runs the loop and returns the fitted
+variational distribution (rng positional or auto). `reset!(state, problem, ξ0)`
+re-initializes an existing state in place from a new starting point (reuses buffers;
+Reactant-safe). `VariationalProblem` resolves the AD backend once (e.g. inferring
+`AutoReactant` from a Reactant array position).
 
 Under Reactant, `step_vi!` is a pure in-place mutation with no host-only state,
 so you compile it yourself and loop the compiled thunk:

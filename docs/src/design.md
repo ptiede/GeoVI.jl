@@ -250,9 +250,14 @@ q = distribution(problem, state)  # an AbstractVariationalDistribution
 Monte-Carlo set at the current mean, then optimize the variational parameters against
 that fixed set (the `draw → optimize-against-fixed-samples → resample` loop).
 
-`fit(problem, n; rng)` is a convenience that runs the loop and returns the posterior.
-Under Reactant, `step_vi!` is a pure in-place mutation the user `@compile`s themselves
-and loops; `fit` does this for you (compile `step_vi!` once, then loop the thunk).
+`init([rng], problem[, ξ0])` accepts an optional starting latent point `ξ0`; omitting
+rng auto-generates one. `reset!(state, problem, ξ0)` restarts an existing state in
+place from a new starting point (reuses buffers; Reactant-safe).
+
+`fit([rng], problem, n)` is a convenience that runs the loop and returns the posterior
+(rng positional or auto). Under Reactant, `step_vi!` is a pure in-place mutation the
+user `@compile`s themselves and loops; `fit` does this for you (compile `step_vi!` once,
+then loop the thunk).
 
 ## Example User Flow
 
@@ -279,7 +284,7 @@ problem = VariationalProblem(
     adtype    = ADTypes.AutoEnzyme(),
 )
 
-q     = fit(problem, 8; rng)        # returns the fitted variational distribution
+q     = fit(rng, problem, 8)        # returns the fitted variational distribution
 draws = rand(rng, q, 100)           # draw arbitrarily many new samples
 μ     = q.mean                      # the latent mean
 ```
