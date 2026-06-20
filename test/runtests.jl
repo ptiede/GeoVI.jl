@@ -670,6 +670,36 @@ end
         @test_throws ArgumentError GeoVI._fdivergence_value(
             MGVIFamily(), GeoVI.ForwardKL(), lh, xi0, nothing
         )
+
+        @testset "init/reset! initial point" begin
+            # ── init with an explicit ξ0 overrides problem.initial_samples.position ──
+            xi_new = [3.0]
+            rng_a, st_a = init(MersenneTwister(5), mgvi_problem, xi_new)
+            @test st_a.position == xi_new          # θ derived from ξ0 (array family: θ is the latent)
+            @test st_a.position !== xi_new         # …but a fresh copy, not aliased
+            @test size(st_a.residuals) == (8, 1)   # buffer still sized from the (same-length) latent
+
+            # ── init with no ξ0 is unchanged: derives from the problem's xi0 ──
+            _, st_b = init(MersenneTwister(5), mgvi_problem)
+            @test st_b.position == xi0
+
+            # ── auto-rng forms run and match the problem's xi0 ──
+            _, st_c = init(mgvi_problem)
+            @test st_c.position == xi0
+            _, st_d = init(mgvi_problem, xi_new)
+            @test st_d.position == xi_new
+
+            # ── mean-field: ξ0 seeds θ.mean (θ is a NamedTuple) ──
+            mf_problem = VariationalProblem(
+                lh, xi0;
+                family = MeanFieldGaussian(),
+                estimator = MCEstimator(n_samples = 4, mirrored = true),
+                optimizer = Optimisers.Adam(0.05),
+            )
+            _, st_mf = init(MersenneTwister(5), mf_problem, xi_new)
+            @test st_mf.position.mean == xi_new
+            @test all(iszero, st_mf.position.logstd)
+        end
     end
 
     @testset "VI phases (draw_samples! / update!)" begin

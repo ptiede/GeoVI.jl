@@ -142,31 +142,40 @@ _init_optimizer_state(problem::VariationalProblem, position) =
     _optimizer_state(problem.optimizer, position, nothing)
 
 """
-    init([rng], problem) -> (rng, state)
+    init([rng], problem[, ξ0]) -> (rng, state)
 
 Allocate the [`VIState`](@ref) for `problem` — a fresh copy of the initial
-position, the residual buffer, and the optimizer state —
-and return it together with the loop RNG to thread through [`step_vi!`](@ref). For
-an `AutoReactant` problem the RNG is wrapped into a `Reactant.ReactantRNG` (the
-compiled step is built lazily by `fit`, or by the user calling
-`@compile step_vi!(...)`). `rng` defaults to `Random.default_rng()`.
+position, the residual buffer, and the optimizer state — and return it together
+with the loop RNG to thread through [`step_vi!`](@ref).
+
+`ξ0` optionally overrides the problem's initial latent point
+(`problem.initial_samples.position`); it is the **starting latent point** (for
+MGVI/geoVI the mean the optimizer starts from, for mean-field the seed for
+`(; mean = ξ0, logstd = 0)`). This is how you restart from a new point without
+rebuilding the `problem`. To restart an *existing* state in place (reusing its
+buffers), use [`reset!`](@ref) instead.
+
+`rng` is first-positional or auto-generated (`Random.default_rng()`); it is never
+a keyword. For an `AutoReactant` problem the RNG is wrapped into a
+`Reactant.ReactantRNG` (the compiled step is built lazily by `fit`, or by the
+user calling `@compile step_vi!(...)`).
 
 The residual buffer starts zero-filled; [`step_vi!`](@ref) redraws it at the
 start of every step.
 """
-function init(rng::AbstractRNG, problem::VariationalProblem)
-    θ = init_params(problem.family, problem.initial_samples.position)
-    # All buffers are sized from the user's initial latent point ξ₀ (latent-shaped by
+function init(rng::AbstractRNG, problem::VariationalProblem, ξ0 = nothing)
+    # All buffers are sized from the latent point ξ₀ (latent-shaped by
     # construction), so the interface needs no `θ → latent` projection.
-    latent = problem.initial_samples.position
+    latent = something(ξ0, problem.initial_samples.position)
+    θ = init_params(problem.family, latent)
     residuals = _init_residual_buffer(problem, latent)
     optimizer_state = _init_optimizer_state(problem, θ)
     wrapped_rng = _wrap_rng(problem.adtype, rng)
     return wrapped_rng, VIState(θ, residuals, optimizer_state)
 end
 
-init(problem::VariationalProblem; rng::AbstractRNG = Random.default_rng()) =
-    init(rng, problem)
+init(problem::VariationalProblem) = init(Random.default_rng(), problem)
+init(problem::VariationalProblem, ξ0) = init(Random.default_rng(), problem, ξ0)
 
 # ── Sample-block plumbing (Reactant-safe) ──────────────────────────────────
 
