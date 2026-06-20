@@ -100,16 +100,22 @@ struct _ReactantLinearization{F, X, V}
     value::V
 end
 
+# Both directions differentiate the same in-place `_forward_to!`, differing only in mode
+# and which shadow is seeded/read: forward seeds the input tangent `v` and reads the JVP
+# out of the output shadow `dy`; reverse (below) seeds the output cotangent `η` and reads
+# the VJP out of the input shadow `dx`. Under Reactant the throwaway primal buffer `y` and
+# the `copyto!` are fused/elided by XLA, so the symmetric form costs nothing here.
 function GeoVI.pushforward(lin::_ReactantLinearization, v::AbstractArray)
-    # `Forward` and `ForwardWithPrimal` produce the identical JVP; the latter only additionally
-    # returns the primal (which we discard), so the choice is irrelevant to the tangent.
-    (dres,) = Reactant.Enzyme.autodiff(
+    y = zero(lin.value)
+    dy = zero(lin.value)
+    Reactant.Enzyme.autodiff(
         Reactant.Enzyme.Forward,
-        lin.forward,
-        Reactant.Enzyme.Duplicated,
+        _forward_to!,
+        Reactant.Enzyme.Duplicated(y, dy),
         Reactant.Enzyme.Duplicated(lin.x, v),
+        Reactant.Enzyme.Const(lin.forward),
     )
-    return dres
+    return dy
 end
 
 function GeoVI.pullback(lin::_ReactantLinearization, η::AbstractArray)
