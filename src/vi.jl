@@ -177,6 +177,45 @@ end
 init(problem::VariationalProblem) = init(Random.default_rng(), problem)
 init(problem::VariationalProblem, ξ0) = init(Random.default_rng(), problem, ξ0)
 
+# Latent-sized reference array inside a θ container, for reset!'s size check.
+# Array families: θ *is* the latent. Mean-field: θ.mean is latent-sized.
+_latent_ref(θ::AbstractArray) = θ
+_latent_ref(θ) = first(values(θ))
+
+"""
+    reset!(state, problem, ξ0) -> state
+
+Re-initialize an existing [`VIState`](@ref) in place to restart from a new
+starting latent point `ξ0`, reusing `state`'s buffers instead of allocating.
+This is [`init`](@ref) for an already-allocated state: the variational parameters
+are rebuilt from `ξ0` via `init_params`, the residual buffer is zeroed (it is
+redrawn at the start of every [`step_vi!`](@ref) anyway), and the optimizer state
+is reset to fresh (momentum cleared).
+
+`state.position` and `state.residuals` keep their array identity (so a compiled
+`step_vi!` thunk stays valid under Reactant); the optimizer state is reassigned,
+matching [`update!`](@ref)'s per-step behavior. `ξ0` must match the existing
+latent size — `reset!` cannot resize; call [`init`](@ref) for a different size.
+"""
+function reset!(state::VIState, problem::VariationalProblem, ξ0::AbstractArray)
+    ref = _latent_ref(state.position)
+    size(ref) == size(ξ0) || throw(
+        DimensionMismatch(
+            "reset! cannot resize: state latent size $(size(ref)), new ξ0 size " *
+                "$(size(ξ0)). Use `init` to allocate a fresh state of the new size."
+        ),
+    )
+    θ_new = init_params(problem.family, ξ0)
+    # Leaf-wise in-place copy preserves position-buffer identity (cf. `update!`);
+    # for a bare-array θ this is exactly `copyto!(state.position, θ_new)`.
+    fmap(copyto!, state.position, θ_new)
+    state.residuals === nothing ||
+        fill!(state.residuals, zero(eltype(state.residuals)))
+    # Reassign (do NOT fmap-copy): optimizer trees have non-array leaves.
+    state.optimizer_state = _init_optimizer_state(problem, state.position)
+    return state
+end
+
 # ── Sample-block plumbing (Reactant-safe) ──────────────────────────────────
 
 function _single_sample_block(residual::AbstractArray)

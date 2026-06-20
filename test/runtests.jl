@@ -699,6 +699,37 @@ end
             _, st_mf = init(MersenneTwister(5), mf_problem, xi_new)
             @test st_mf.position.mean == xi_new
             @test all(iszero, st_mf.position.logstd)
+
+            # ── reset! re-initializes an existing state in place ──
+            rng_r, st = init(MersenneTwister(5), mgvi_problem)         # NewtonCG ⇒ optimizer_state === nothing
+            pos_before = st.position
+            res_before = st.residuals
+            fill!(st.residuals, 7.0)                                   # dirty the residual buffer
+            out = reset!(st, mgvi_problem, xi_new)
+            @test out === st                                           # returns the same object
+            @test st.position === pos_before                           # position identity preserved (Reactant)
+            @test st.residuals === res_before                          # residual identity preserved (Reactant)
+            @test st.position == xi_new                                # …but values now derive from ξ0
+            @test all(iszero, st.residuals)                            # residuals zeroed
+            @test st.optimizer_state === nothing                       # NewtonCG: still nothing
+
+            # ── reset! with a stateful optimizer reassigns a fresh (zeroed) state ──
+            rng_o, st_o = init(MersenneTwister(5), mf_problem)
+            for _ in 1:5
+                step_vi!(rng_o, mf_problem, st_o)                      # build Adam momentum
+            end
+            @test st_o.optimizer_state !== nothing
+            reset!(st_o, mf_problem, xi_new)
+            @test st_o.position.mean == xi_new
+            @test all(iszero, st_o.position.logstd)
+            # optimizer state is fresh: flattened state equals a freshly-init'd one at the
+            # same point (destructure flattens the whole Leaf tree, incl. zeroed momentum).
+            _, st_fresh = init(MersenneTwister(5), mf_problem, xi_new)
+            @test Optimisers.destructure(st_o.optimizer_state)[1] ==
+                Optimisers.destructure(st_fresh.optimizer_state)[1]
+
+            # ── reset! cannot resize: wrong-length ξ0 errors clearly ──
+            @test_throws DimensionMismatch reset!(st, mgvi_problem, [1.0, 2.0])
         end
     end
 
