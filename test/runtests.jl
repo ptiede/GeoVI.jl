@@ -728,6 +728,25 @@ end
             @test Optimisers.destructure(st_o.optimizer_state)[1] ==
                 Optimisers.destructure(st_fresh.optimizer_state)[1]
 
+            # ── reset! on a no-samples (MAP) problem exercises the residuals===nothing guard ──
+            _, st_n = init(MersenneTwister(5), adam_problem)
+            @test st_n.residuals === nothing
+            reset!(st_n, adam_problem, xi_new)        # must not error on the nothing-residuals branch
+            @test st_n.position == xi_new
+            @test st_n.residuals === nothing
+
+            # ── round-trip: fit, reset! to a new point in place, fit again from the reset start ──
+            rng_rt, st_rt = init(MersenneTwister(5), mgvi_problem)
+            for _ in 1:3
+                step_vi!(rng_rt, mgvi_problem, st_rt)
+            end
+            reset!(st_rt, mgvi_problem, [10.0])       # restart far away, reusing buffers
+            @test st_rt.position == [10.0]            # second run starts from the reset point
+            for _ in 1:3
+                step_vi!(rng_rt, mgvi_problem, st_rt)
+            end
+            @test _post_mean(distribution(mgvi_problem, st_rt)) ≈ analytic_mean atol = 0.2 rtol = 0.0
+
             # ── reset! cannot resize: wrong-length ξ0 errors clearly ──
             @test_throws DimensionMismatch reset!(st, mgvi_problem, [1.0, 2.0])
         end
