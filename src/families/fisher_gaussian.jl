@@ -19,6 +19,9 @@ const FisherGaussian = Union{MGVIFamily, GeoVIFamily}
 _draw_linear_kwargs(fam::FisherGaussian) =
     (; _draw_linear_kwargs(fam.solver)..., throw_on_failure = fam.strict)
 
+# The draw-solve preconditioner (`nothing` for the unpreconditioned default).
+_preconditioner(fam::FisherGaussian) = fam.preconditioner
+
 function draw_samples!(
         fam::FisherGaussian, lh::AbstractLikelihood, μ, residuals, rng::AbstractRNG,
         mirrored::Bool,
@@ -27,14 +30,21 @@ function draw_samples!(
     t = _metric_tangent_template(lh, μ)
     metric_white = randn_like(rng, similar(t, (n, size(t)...)))
     prior_white = randn_like(rng, similar(μ, (n, size(μ)...)))
+    # Build the Jacobi (or other) preconditioner ONCE at the expansion point μ — its
+    # Hutchinson metric matvecs are amortized over all n draws (the metric is the same at
+    # μ for every sample of this step). `nothing` ⇒ unpreconditioned draw.
+    precond = _build_preconditioner(_preconditioner(fam), lh, μ, rng)
+    # The curve's metric is ≈ (I+F)², so it needs the squared-spectrum variant of the
+    # same deflation (see `_curve_preconditioner`); both are amortized over all n draws.
+    curve_precond = _curve_preconditioner(precond)
     # `@trace for` (track_numbers = false) → one MLIR while-loop body, not n unrolled copies
     # of the full CG + forward-model graph.
     @trace track_numbers = false for i in 1:n
         ms = _metric_sample_from_white(
             lh, μ, _sample_slice(metric_white, i), _sample_slice(prior_white, i)
         )
-        linear = draw_linear_residual(lh, μ, ms; _draw_linear_kwargs(fam)...)
-        _write_sample_block!(residuals, i, _refine_residual(fam, lh, μ, linear, ms, mirrored))
+        linear = draw_linear_residual(lh, μ, ms; preconditioner = precond, _draw_linear_kwargs(fam)...)
+        _write_sample_block!(residuals, i, _refine_residual(fam, lh, μ, linear, ms, mirrored, curve_precond))
     end
     return residuals
 end
@@ -121,8 +131,10 @@ function Base.rand(rng::AbstractRNG, d::FisherGaussianDistribution)
     ms = _metric_sample_from_white(
         lh, μ, randn_like(rng, _metric_tangent_template(lh, μ)), randn_like(rng, μ)
     )
-    linear = draw_linear_residual(lh, μ, ms; _draw_linear_kwargs(fam)...)
-    block = _refine_residual(fam, lh, μ, linear, ms, false)
+    precond = _build_preconditioner(_preconditioner(fam), lh, μ, rng)
+    curve_precond = _curve_preconditioner(precond)
+    linear = draw_linear_residual(lh, μ, ms; preconditioner = precond, _draw_linear_kwargs(fam)...)
+    block = _refine_residual(fam, lh, μ, linear, ms, false, curve_precond)
     return first(transport_and_logjac(fam, μ, _sample_slice(block, 1)))
 end
 

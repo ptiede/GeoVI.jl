@@ -15,14 +15,21 @@ struct _EnzymeLinearization{F, X, V}
     value::V
 end
 
+# Both directions differentiate the same in-place `_forward_to!`, differing only in mode
+# and which shadow is seeded/read: forward seeds the input tangent `v` and reads the JVP
+# out of the output shadow `dy`; reverse (below) seeds the output cotangent `η` and reads
+# the VJP out of the input shadow `dx`.
 function GeoVI.pushforward(lin::_EnzymeLinearization, v::AbstractArray)
-    dres, _ = Enzyme.autodiff(
-        Enzyme.ForwardWithPrimal,
-        lin.forward,
-        Enzyme.Duplicated,
+    y = zero(lin.value)
+    dy = zero(lin.value)
+    Enzyme.autodiff(
+        Enzyme.Forward,
+        _forward_to!,
+        Enzyme.Duplicated(y, dy),
         Enzyme.Duplicated(lin.x, v),
+        Enzyme.Const(lin.forward),
     )
-    return dres
+    return dy
 end
 
 function GeoVI.pullback(lin::_EnzymeLinearization, η::AbstractArray)

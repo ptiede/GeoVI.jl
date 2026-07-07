@@ -100,16 +100,22 @@ struct _ReactantLinearization{F, X, V}
     value::V
 end
 
+# Both directions differentiate the same in-place `_forward_to!`, differing only in mode
+# and which shadow is seeded/read: forward seeds the input tangent `v` and reads the JVP
+# out of the output shadow `dy`; reverse (below) seeds the output cotangent `η` and reads
+# the VJP out of the input shadow `dx`. Under Reactant the throwaway primal buffer `y` and
+# the `copyto!` are fused/elided by XLA, so the symmetric form costs nothing here.
 function GeoVI.pushforward(lin::_ReactantLinearization, v::AbstractArray)
-    # `Forward` and `ForwardWithPrimal` produce the identical JVP; the latter only additionally
-    # returns the primal (which we discard), so the choice is irrelevant to the tangent.
-    (dres,) = Reactant.Enzyme.autodiff(
+    y = zero(lin.value)
+    dy = zero(lin.value)
+    Reactant.Enzyme.autodiff(
         Reactant.Enzyme.Forward,
-        lin.forward,
-        Reactant.Enzyme.Duplicated,
+        _forward_to!,
+        Reactant.Enzyme.Duplicated(y, dy),
         Reactant.Enzyme.Duplicated(lin.x, v),
+        Reactant.Enzyme.Const(lin.forward),
     )
-    return dres
+    return dy
 end
 
 function GeoVI.pullback(lin::_ReactantLinearization, η::AbstractArray)
@@ -192,6 +198,23 @@ function GeoVI._wrap_rng(::ADTypes.AutoReactant, rng::AbstractRNG)
     seed = rand(rng, UInt64, 2)
     return Reactant.ReactantRNG(Reactant.to_rarray(seed))
 end
+
+# ScaledMGVI `init_params` expands the latent to the flat θ = [μ; 0] (or builds [mean; logscale]
+# from a `(; mean, logscale)` NamedTuple) via `vcat`. Concatenating device arrays eagerly
+# scalar-indexes, so build θ on the host once and move it to the device. Dispatch keys on the
+# input being device-typed, so the host (CPU) path keeps the plain core method.
+GeoVI.init_params(::GeoVI.ScaledMGVI, μ::Reactant.ConcreteRArray) =
+    Reactant.to_rarray(GeoVI.scaled_init(Array(μ)))
+GeoVI.init_params(
+    ::GeoVI.ScaledMGVI,
+    θ0::NamedTuple{names, <:Tuple{<:Reactant.ConcreteRArray, <:Reactant.ConcreteRArray}},
+) where {names} =
+    Reactant.to_rarray(GeoVI.scaled_init(Array(θ0.mean), Array(θ0.logscale)))
+
+# Random default latent on the device (no-ξ0 `init`/`fit`): draw on the host with the given rng
+# (deterministic, and Reactant random-gen wants a traced context), then move to the device.
+GeoVI._random_latent(rng, ::ADTypes.AutoReactant, latent_proto) =
+    Reactant.to_rarray(GeoVI.randn_like(rng, Array(latent_proto)))
 
 # Drive the loop under Reactant: compile `step_vi!` ONCE for the preallocated
 # buffers, then call the compiled thunk `n_iterations` times. `step_vi!` mutates the

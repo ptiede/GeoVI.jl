@@ -72,6 +72,7 @@ function update_nonlinear_residual(
         optimizer = NewtonCG(),
         optimizer_options = (;),
         throw_on_failure::Bool = true,
+        preconditioner = nothing,
     )
     return update_nonlinear_residual(
         lh,
@@ -82,6 +83,7 @@ function update_nonlinear_residual(
         optimizer = optimizer,
         optimizer_options = optimizer_options,
         throw_on_failure = throw_on_failure,
+        preconditioner = preconditioner,
     )
 end
 
@@ -94,6 +96,7 @@ function update_nonlinear_residual(
         optimizer = NewtonCG(),
         optimizer_options = (;),
         throw_on_failure::Bool = true,
+        preconditioner = nothing,
     )
     metric_sample === nothing && throw(
         ArgumentError(
@@ -152,6 +155,7 @@ function update_nonlinear_residual(
         cg_maxiter = _option(optimizer_options, :cg_maxiter, nothing),
         cg_miniter = _option(optimizer_options, :cg_miniter, 0),
         stepnorm = step -> _nonlinear_residual_stepnorm(hep, step),
+        preconditioner = preconditioner,
     )
 
     if throw_on_failure && _runtime_failure_enabled(sample0) && !result.converged
@@ -173,6 +177,7 @@ function draw_residual(
         optimizer = NewtonCG(),
         optimizer_options = (;),
         throw_on_failure::Bool = true,
+        preconditioner = nothing,
     )
     linear_draw = draw_linear_residual(
         lh,
@@ -190,6 +195,7 @@ function draw_residual(
         optimizer = optimizer,
         optimizer_options = optimizer_options,
         throw_on_failure = throw_on_failure,
+        preconditioner = preconditioner,
     )
     negative_update = update_nonlinear_residual(
         lh,
@@ -200,6 +206,7 @@ function draw_residual(
         optimizer = optimizer,
         optimizer_options = optimizer_options,
         throw_on_failure = throw_on_failure,
+        preconditioner = preconditioner,
     )
 
     residuals = _stack_residuals(positive_update.residual, negative_update.residual)
