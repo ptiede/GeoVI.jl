@@ -243,8 +243,7 @@ end
 
         simple_lh = GaussianLikelihood([0.0]; precision = [1.0])
         problem = VariationalProblem(
-            simple_lh,
-            [0.0];
+            simple_lh;
             family = MGVIFamily(),
             divergence = ReverseKL(),
             estimator = est,
@@ -254,60 +253,57 @@ end
         @test GeoVI._n_base_draws(problem) == 3
         @test problem.optimizer.maxiter == 20
 
-        rng, state = init(MersenneTwister(2), problem)
+        rng, state = init(MersenneTwister(2), problem, [0.0])
         @test state isa VIState
         @test rng isa MersenneTwister
         @test size(state.residuals) == (6, 1)
 
         @test_throws ArgumentError update_nonlinear_residual(simple_lh, [0.0], [0.0])
         @test_throws ArgumentError VariationalProblem(
-            simple_lh, [0.0]; divergence = GeoVI.ForwardKL(), optimizer = NewtonCG()
+            simple_lh; divergence = GeoVI.ForwardKL(), optimizer = NewtonCG()
         )
         @test_throws ArgumentError VariationalProblem(
-            simple_lh, [0.0]; divergence = ReverseKL(), optimizer = :adam
+            simple_lh; divergence = ReverseKL(), optimizer = :adam
         )
 
         # the positional constructor validates too (no bypass around _require_supported)
         @test_throws ArgumentError VariationalProblem(
-            simple_lh, [0.0], MeanFieldGaussian(), ReverseKL(), MCEstimator(),
+            simple_lh, MeanFieldGaussian(), ReverseKL(), MCEstimator(),
             NewtonCG(), GeoVI.ADTypes.AutoFiniteDiff(),
         )
 
-        # a structured-θ family with no samples must fail loudly at construction:
-        # the sample-free MAP objective is undefined off the latent point.
+        # a structured-θ family with no samples must fail loudly — the sample-free MAP
+        # objective is undefined off the latent point. This check now runs in `init`
+        # (once θ is built from ξ0), not at construction.
         struct StructuredThetaFam <: GeoVI.AbstractVariationalFamily end
         GeoVI.init_params(::StructuredThetaFam, x) = (; mean = copy(x))
-        @test_throws ArgumentError VariationalProblem(
-            simple_lh, [0.0]; family = StructuredThetaFam(),
-            estimator = MCEstimator(n_samples = 0), optimizer = Optimisers.Descent(0.1),
+        @test_throws ArgumentError init(
+            MersenneTwister(3),
+            VariationalProblem(
+                simple_lh; family = StructuredThetaFam(),
+                estimator = MCEstimator(n_samples = 0), optimizer = Optimisers.Descent(0.1),
+            ),
+            [0.0],
         )
 
-        # initial Samples must not carry residuals (step_vi! redraws them, so they
-        # could never be used — rejected at construction)
-        @test_throws ArgumentError VariationalProblem(
-            simple_lh, Samples([0.0], reshape([0.25, -0.25], (2, 1)); keys = nothing);
-            family = MGVIFamily(),
-            estimator = MCEstimator(n_samples = 2), optimizer = NewtonCG(),
-        )
-        # a position-only Samples is fine, and the buffer starts zero-filled (no
-        # "residuals not yet drawn" state exists after init)
+        # the residual buffer starts zero-filled at init (no "residuals not yet
+        # drawn" state exists after init)
         zerofill_problem = VariationalProblem(
-            simple_lh, Samples([0.0], nothing; keys = nothing); family = MGVIFamily(),
+            simple_lh; family = MGVIFamily(),
             estimator = MCEstimator(n_samples = 2), optimizer = NewtonCG(),
         )
-        _, zerofill_state = init(MersenneTwister(3), zerofill_problem)
+        _, zerofill_state = init(MersenneTwister(3), zerofill_problem, [0.0])
         @test zerofill_state.residuals == zeros(2, 1)
 
         nd_problem = VariationalProblem(
-            simple_lh,
-            [0.0];
+            simple_lh;
             family = GeoVIFamily(),
             divergence = ReverseKL(),
             estimator = MCEstimator(n_samples = 2),
             optimizer = NewtonCG(),
             adtype = GeoVI.ADTypes.NoAutoDiff(),
         )
-        @test_throws ArgumentError fit(MersenneTwister(1), nd_problem, 1)
+        @test_throws ArgumentError fit(MersenneTwister(1), nd_problem, [0.0], 1)
     end
 
     @testset "conjugate gradient stopping" begin
@@ -366,6 +362,97 @@ end
         # successive steps ‖g‖→0 tightens the forcing until x lands on xstar.
         res_converged = run_newton(NewtonCG(maxiter = 50))
         @test res_converged.x ≈ xstar atol = 1.0e-6 rtol = 1.0e-6
+    end
+
+    @testset "preconditioned conjugate gradient" begin
+        # Diagonal SPD with κ = 1e8 — a capped unpreconditioned CG starves, a Jacobi
+        # preconditioner collapses κ so it converges immediately.
+        rng = MersenneTwister(0xbc)
+        Dd = 120
+        d = exp.(range(0.0, log(1.0e8), length = Dd))      # diagonal scale 1 … 1e8
+        op = v -> d .* v
+        b = randn(rng, Dd)
+        xstar = b ./ d
+
+        # identity preconditioner reproduces plain CG bit-for-bit (the default path).
+        xa, ia = GeoVI.solve(ConjugateGradient(rtol = 1.0e-10, maxiter = 500), op, b)
+        xb, ib = GeoVI.solve(ConjugateGradient(rtol = 1.0e-10, maxiter = 500), op, b; preconditioner = identity)
+        @test xa == xb
+        @test ia.iterations == ib.iterations
+
+        # unpreconditioned, capped low → starves; Jacobi (1/d) → exact in ≤2 steps.
+        _, iu = GeoVI.solve(ConjugateGradient(rtol = 1.0e-8, maxiter = 20), op, b)
+        @test !iu.converged
+        xp, ip = GeoVI.solve(ConjugateGradient(rtol = 1.0e-8, maxiter = 20), op, b; preconditioner = v -> v ./ d)
+        @test ip.converged
+        @test ip.iterations <= 2
+        @test xp ≈ xstar rtol = 1.0e-6
+    end
+
+    @testset "Jacobi-preconditioned draw" begin
+        # Likelihood whose data Fisher diagonal spans 1 … 1e8 (the small-noise
+        # stiff-direction pathology): the unpreconditioned draw over-disperses the
+        # stiff components, the Jacobi-preconditioned draw recovers (I+F)⁻¹.
+        Dd = 50
+        scale = exp.(range(0.0, log(1.0e4), length = Dd))   # F_ii = scale_i² ∈ [1, 1e8]
+        A = Diagonal(scale)
+        lh = compose(
+            GaussianLikelihood(zeros(Dd); precision = ones(Dd)),
+            x -> A * x; pushforward = (x, v) -> A * v, pullback = (x, η) -> A' * η,
+        )
+        xi = zeros(Dd)
+        truediag = 1 .+ scale .^ 2
+
+        # Hutchinson estimate recovers diag(I+F).
+        dest = GeoVI._posterior_metric_diag(lh, xi, MersenneTwister(1), 5000)
+        @test isapprox(dest, truediag; rtol = 0.05)
+        @test all(dest .>= 1)                               # floored at the prior bound
+
+        pm = I + A' * A
+        ms = draw_metric_sample(lh, xi, MersenneTwister(11))
+        xstar = pm \ ms.metric
+        precond = GeoVI._build_preconditioner(JacobiPreconditioner(n_probes = 5000), lh, xi, MersenneTwister(7))
+        dp = draw_linear_residual(lh, xi, ms; cg_rtol = 1.0e-6, cg_maxiter = 200, throw_on_failure = false, preconditioner = precond)
+        @test dp.info.converged
+        @test isapprox(dp.residual, xstar; rtol = 1.0e-4)
+        # same system, capped unpreconditioned → does not converge.
+        du = draw_linear_residual(lh, xi, ms; cg_rtol = 1.0e-6, cg_maxiter = 10, throw_on_failure = false)
+        @test !du.info.converged
+    end
+
+    @testset "low-rank deflation preconditioner" begin
+        # A COUPLED Fisher: F = Vf diag(λ) Vfᵀ with Vf a random (non-axis-aligned)
+        # basis and a spread stiff cluster 1e4…1e8 over a benign bulk. Jacobi can't
+        # help (off-diagonal coupling); a rank-`k` deflation collapses κ to the bulk.
+        Dd = 120; k = 12
+        rng = MersenneTwister(0xdef)
+        Vf = Matrix(qr(randn(rng, Dd, Dd)).Q)
+        λstiff = exp.(range(log(1.0e4), log(1.0e8), length = k))
+        λbulk = exp.(range(log(1.0), log(8.0), length = Dd - k))
+        λ = vcat(λstiff, λbulk)
+        A = Diagonal(sqrt.(λ)) * Vf'
+        lh = compose(
+            GaussianLikelihood(zeros(Dd); precision = ones(Dd)),
+            x -> A * x; pushforward = (x, v) -> A * v, pullback = (x, η) -> A' * η,
+        )
+        xi = zeros(Dd)
+        M = I + Vf * Diagonal(λ) * Vf'
+        ms = draw_metric_sample(lh, xi, MersenneTwister(2))
+        xstar = M \ ms.metric
+
+        pd = GeoVI._build_preconditioner(DeflationPreconditioner(rank = k, oversample = 8), lh, xi, MersenneTwister(9))
+        # the kept basis is orthonormal and the deflated metric is well-conditioned
+        @test isapprox(pd.V * pd.V', I; atol = 1.0e-8)
+        Minv = reduce(hcat, (pd(setindex!(zeros(Dd), 1.0, i)) for i in 1:Dd))
+        κeig = (e -> maximum(e) / minimum(e))(real.(eigvals(Minv * M)))
+        @test κeig < 50                                   # κ collapsed from ~1e8 to ~bulk
+
+        cap = 25
+        dd = draw_linear_residual(lh, xi, ms; cg_rtol = 1.0e-8, cg_maxiter = cap, throw_on_failure = false, preconditioner = pd)
+        du = draw_linear_residual(lh, xi, ms; cg_rtol = 1.0e-8, cg_maxiter = cap, throw_on_failure = false)
+        @test dd.info.converged                            # deflation converges in-cap
+        @test isapprox(dd.residual, xstar; rtol = 1.0e-5)
+        @test !du.info.converged                           # unpreconditioned starves
     end
 
     @testset "MGVI linear residuals" begin
@@ -578,8 +665,7 @@ end
         est = MCEstimator(n_samples = 8, mirrored = true)
 
         mgvi_problem = VariationalProblem(
-            lh,
-            xi0;
+            lh;
             family = mgvi_family,
             divergence = ReverseKL(),
             estimator = est,
@@ -587,19 +673,19 @@ end
         )
 
         # in-place step_vi! mutates one VIState
-        rng_step, step_state = init(MersenneTwister(5), mgvi_problem)
+        rng_step, step_state = init(MersenneTwister(5), mgvi_problem, xi0)
         step_vi!(rng_step, mgvi_problem, step_state)
         @test size(step_state.residuals, 1) == 8
         @test distribution(mgvi_problem, step_state) isa FisherGaussianDistribution
 
         # fit returns the fitted variational distribution
-        mgvi_post = fit(MersenneTwister(5), mgvi_problem, 3)
+        mgvi_post = fit(MersenneTwister(5), mgvi_problem, xi0, 3)
         @test mgvi_post isa AbstractVariationalDistribution
         @test _post_mean(mgvi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
         @test size(rand(MersenneTwister(7), mgvi_post, 8)) == (8, 1)   # draw fresh samples
 
         # the explicit loop reuses one VIState and matches fit bit-for-bit
-        rng, state = init(MersenneTwister(5), mgvi_problem)
+        rng, state = init(MersenneTwister(5), mgvi_problem, xi0)
         for _ in 1:3
             step_vi!(rng, mgvi_problem, state)
         end
@@ -615,51 +701,48 @@ end
             curve = NewtonCG(maxiter = 4, xtol = 1.0e-10, cg_rtol = 1.0e-12, cg_maxiter = 10),
         )
         geovi_problem = VariationalProblem(
-            lh,
-            xi0;
+            lh;
             family = geovi_family,
             divergence = ReverseKL(),
             estimator = est,
             optimizer = outer,
         )
-        rng_g, geovi_state = init(MersenneTwister(5), geovi_problem)
+        rng_g, geovi_state = init(MersenneTwister(5), geovi_problem, xi0)
         step_vi!(rng_g, geovi_problem, geovi_state)
         @test geovi_problem.family isa GeoVIFamily
-        geovi_post = fit(MersenneTwister(5), geovi_problem, 3)
+        geovi_post = fit(MersenneTwister(5), geovi_problem, xi0, 3)
         @test _post_mean(geovi_post) ≈ analytic_mean atol = 0.2 rtol = 0.0
 
         # A bare Optimisers rule is the outer optimizer: each step_vi! takes one
         # gradient step, and the user owns the iteration count. With no samples
         # this optimizes the latent mean (MAP) directly.
         adam_problem = VariationalProblem(
-            lh,
-            xi0;
+            lh;
             family = MGVIFamily(),
             divergence = ReverseKL(),
             estimator = MCEstimator(n_samples = 0),
             optimizer = Optimisers.Adam(0.05),
         )
-        adam_post = fit(MersenneTwister(11), adam_problem, 400)
+        adam_post = fit(MersenneTwister(11), adam_problem, xi0, 400)
         @test _post_mean(adam_post) ≈ analytic_mean atol = 1.0e-2 rtol = 0.0
 
         # Adam optimizer state persists across steps: two steps (carrying
         # momentum) differ from a fresh single step at the same position.
         adam_step_problem = VariationalProblem(
-            lh,
-            xi0;
+            lh;
             family = MGVIFamily(),
             divergence = ReverseKL(),
             estimator = MCEstimator(n_samples = 0),
             optimizer = Optimisers.Adam(0.05),
         )
-        rng_s, s = init(MersenneTwister(12), adam_step_problem)
+        rng_s, s = init(MersenneTwister(12), adam_step_problem, xi0)
         step_vi!(rng_s, adam_step_problem, s)
         pos1 = copy(s.position)
         @test s.optimizer_state !== nothing
         step_vi!(rng_s, adam_step_problem, s)
         @test s.optimizer_state !== nothing
         with_momentum = s.position[1]
-        rng_f, sf = init(MersenneTwister(12), adam_step_problem)
+        rng_f, sf = init(MersenneTwister(12), adam_step_problem, xi0)
         copyto!(sf.position, pos1)
         step_vi!(rng_f, adam_step_problem, sf)
         @test abs(with_momentum - sf.position[1]) > 1.0e-8
@@ -672,26 +755,26 @@ end
         )
 
         @testset "init/reset! initial point" begin
-            # ── init with an explicit ξ0 overrides problem.initial_samples.position ──
+            # ── init builds θ from the explicit ξ0 starting point ──
             xi_new = [3.0]
             rng_a, st_a = init(MersenneTwister(5), mgvi_problem, xi_new)
             @test st_a.position == xi_new          # θ derived from ξ0 (array family: θ is the latent)
             @test st_a.position !== xi_new         # …but a fresh copy, not aliased
             @test size(st_a.residuals) == (8, 1)   # buffer still sized from the (same-length) latent
 
-            # ── init with no ξ0 is unchanged: derives from the problem's xi0 ──
-            _, st_b = init(MersenneTwister(5), mgvi_problem)
+            # ── init with a given ξ0 builds θ from it ──
+            _, st_b = init(MersenneTwister(5), mgvi_problem, xi0)
             @test st_b.position == xi0
 
-            # ── auto-rng forms run and match the problem's xi0 ──
-            _, st_c = init(mgvi_problem)
+            # ── auto-rng forms (no explicit rng) run and thread the given ξ0 ──
+            _, st_c = init(mgvi_problem, xi0)
             @test st_c.position == xi0
             _, st_d = init(mgvi_problem, xi_new)
             @test st_d.position == xi_new
 
             # ── mean-field: ξ0 seeds θ.mean (θ is a NamedTuple) ──
             mf_problem = VariationalProblem(
-                lh, xi0;
+                lh;
                 family = MeanFieldGaussian(),
                 estimator = MCEstimator(n_samples = 4, mirrored = true),
                 optimizer = Optimisers.Adam(0.05),
@@ -701,7 +784,7 @@ end
             @test all(iszero, st_mf.position.logstd)
 
             # ── reset! re-initializes an existing state in place ──
-            rng_r, st = init(MersenneTwister(5), mgvi_problem)         # NewtonCG ⇒ optimizer_state === nothing
+            rng_r, st = init(MersenneTwister(5), mgvi_problem, xi0)    # NewtonCG ⇒ optimizer_state === nothing
             pos_before = st.position
             res_before = st.residuals
             fill!(st.residuals, 7.0)                                   # dirty the residual buffer
@@ -714,7 +797,7 @@ end
             @test st.optimizer_state === nothing                       # NewtonCG: still nothing
 
             # ── reset! with a stateful optimizer reassigns a fresh (zeroed) state ──
-            rng_o, st_o = init(MersenneTwister(5), mf_problem)
+            rng_o, st_o = init(MersenneTwister(5), mf_problem, xi0)
             for _ in 1:5
                 step_vi!(rng_o, mf_problem, st_o)                      # build Adam momentum
             end
@@ -729,14 +812,14 @@ end
                 Optimisers.destructure(st_fresh.optimizer_state)[1]
 
             # ── reset! on a no-samples (MAP) problem exercises the residuals===nothing guard ──
-            _, st_n = init(MersenneTwister(5), adam_problem)
+            _, st_n = init(MersenneTwister(5), adam_problem, xi0)
             @test st_n.residuals === nothing
             reset!(st_n, adam_problem, xi_new)        # must not error on the nothing-residuals branch
             @test st_n.position == xi_new
             @test st_n.residuals === nothing
 
             # ── round-trip: fit, reset! to a new point in place, fit again from the reset start ──
-            rng_rt, st_rt = init(MersenneTwister(5), mgvi_problem)
+            rng_rt, st_rt = init(MersenneTwister(5), mgvi_problem, xi0)
             for _ in 1:3
                 step_vi!(rng_rt, mgvi_problem, st_rt)
             end
@@ -761,19 +844,19 @@ end
         est = MCEstimator(n_samples = 32, mirrored = true)
 
         # The residual buffer is preallocated at init: (n_samples, latent...).
-        mgvi = VariationalProblem(lh, zeros(D); family = MGVIFamily(solver = solver), estimator = est, optimizer = outer)
-        _, st = init(MersenneTwister(1), mgvi)
+        mgvi = VariationalProblem(lh; family = MGVIFamily(solver = solver), estimator = est, optimizer = outer)
+        _, st = init(MersenneTwister(1), mgvi, zeros(D))
         @test size(st.residuals) == (32, D)
 
         geovi = VariationalProblem(
-            lh, zeros(D);
+            lh;
             family = GeoVIFamily(solver = solver, curve = NewtonCG(cg_rtol = 1.0e-10, cg_maxiter = 200)),
             estimator = est, optimizer = outer,
         )
 
         # `draw_samples!` is the stochastic phase: it fills the residual buffer, and two
         # successive draws (fresh noise) generally differ.
-        rng, s = init(MersenneTwister(7), geovi)
+        rng, s = init(MersenneTwister(7), geovi, zeros(D))
         GeoVI.draw_samples!(rng, geovi, s)
         @test size(s.residuals) == (32, D)
         r1 = copy(s.residuals)
@@ -782,7 +865,7 @@ end
 
         # The loop is `draw_samples! → update!`: draw a fresh set each iteration, optimize
         # the mean against it (NewtonCG to convergence), and the mean reaches the posterior.
-        rng2, s2 = init(MersenneTwister(9), geovi)
+        rng2, s2 = init(MersenneTwister(9), geovi, zeros(D))
         for _ in 1:8
             GeoVI.draw_samples!(rng2, geovi, s2)
             GeoVI.update!(geovi, s2)
@@ -790,7 +873,7 @@ end
         @test _post_mean(distribution(geovi, s2)) ≈ setup.μ_post atol = 0.15 rtol = 0.0
 
         # `step_vi!` (a fresh draw_samples!+update! per call) also converges.
-        post = fit(MersenneTwister(9), geovi, 8)
+        post = fit(MersenneTwister(9), geovi, zeros(D), 8)
         @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
     end
 
@@ -814,12 +897,12 @@ end
         n_samples = 4
         newton_maxiter = 3
         problem = VariationalProblem(
-            lh, zeros(D);
+            lh;
             family = MGVIFamily(solver = ConjugateGradient(rtol = 1.0e-10, maxiter = 100)),
             estimator = MCEstimator(n_samples = n_samples, mirrored = true),
             optimizer = NewtonCG(maxiter = newton_maxiter, xtol = 1.0e-9, cg_maxiter = 100),
         )
-        rng, st = init(MersenneTwister(11), problem)
+        rng, st = init(MersenneTwister(11), problem, zeros(D))
 
         lin_count[] = 0
         step_vi!(rng, problem, st)
@@ -837,7 +920,7 @@ end
         # per-iteration pins), independent of CG iteration counts.
         curve_maxiter = 4
         geovi_problem = VariationalProblem(
-            lh, zeros(D);
+            lh;
             family = GeoVIFamily(
                 solver = ConjugateGradient(rtol = 1.0e-10, maxiter = 100),
                 curve = NewtonCG(maxiter = curve_maxiter, cg_rtol = 1.0e-10, cg_maxiter = 100),
@@ -845,7 +928,7 @@ end
             estimator = MCEstimator(n_samples = n_samples, mirrored = true),
             optimizer = NewtonCG(maxiter = newton_maxiter, xtol = 1.0e-9, cg_maxiter = 100),
         )
-        rng_g, st_g = init(MersenneTwister(11), geovi_problem)
+        rng_g, st_g = init(MersenneTwister(11), geovi_problem, zeros(D))
         lin_count[] = 0
         step_vi!(rng_g, geovi_problem, st_g)
         # Calibrated (measured = budget, deterministic): the curve adds exactly 2 pins
@@ -855,7 +938,7 @@ end
         @test lin_count[] <= curve_budget
 
         # And the fit still converges to the analytic posterior with caching on.
-        post = fit(MersenneTwister(2), problem, 6)
+        post = fit(MersenneTwister(2), problem, zeros(D), 6)
         @test _post_mean(post) ≈ setup.μ_post atol = 0.15 rtol = 0.0
     end
 
@@ -878,14 +961,13 @@ end
         )
         for family in families
             problem = VariationalProblem(
-                lh,
-                xi0;
+                lh;
                 family = family,
                 divergence = ReverseKL(),
                 estimator = est,
                 optimizer = outer,
             )
-            post = fit(MersenneTwister(2025), problem, 8)
+            post = fit(MersenneTwister(2025), problem, xi0, 8)
             @test _post_mean(post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
 
             # `rand` from the fitted distribution recovers the posterior moments.
@@ -909,14 +991,13 @@ end
             solver = solver, curve = NewtonCG(absdelta = ad, cg_rtol = 1.0e-10, cg_maxiter = 200)
         )
         coupled_problem = VariationalProblem(
-            lh,
-            xi0;
+            lh;
             family = coupled,
             divergence = ReverseKL(),
             estimator = est,
             optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, absdelta = ad, cg_rtol = 1.0e-10, cg_maxiter = 200),
         )
-        coupled_post = fit(MersenneTwister(2025), coupled_problem, 8)
+        coupled_post = fit(MersenneTwister(2025), coupled_problem, xi0, 8)
         @test _post_mean(coupled_post) ≈ setup.μ_post atol = 0.1 rtol = 0.0
 
         # The `delta` convenience (per-d.o.f. tolerance) must be exactly
@@ -927,14 +1008,13 @@ end
             solver = solver, curve = NewtonCG(delta = delta, cg_rtol = 1.0e-10, cg_maxiter = 200)
         )
         delta_problem = VariationalProblem(
-            lh,
-            xi0;
+            lh;
             family = delta_fam,
             divergence = ReverseKL(),
             estimator = est,
             optimizer = NewtonCG(maxiter = 20, xtol = 1.0e-9, delta = delta, cg_rtol = 1.0e-10, cg_maxiter = 200),
         )
-        delta_post = fit(MersenneTwister(2025), delta_problem, 8)
+        delta_post = fit(MersenneTwister(2025), delta_problem, xi0, 8)
         @test _post_mean(delta_post) ≈ _post_mean(coupled_post) atol = 1.0e-12 rtol = 1.0e-12
     end
 
@@ -970,21 +1050,21 @@ end
         xi0 = zeros(D)
 
         mf = VariationalProblem(
-            lh, xi0;
+            lh;
             family = MeanFieldGaussian(),
             divergence = ReverseKL(),
             estimator = MCEstimator(n_samples = 128, mirrored = true),
             optimizer = Optimisers.Adam(0.05),
         )
         # θ is the structured `(; mean, logstd)` NamedTuple; no metric-tangent noise.
-        rng_i, st = init(MersenneTwister(0xfeed), mf)
+        rng_i, st = init(MersenneTwister(0xfeed), mf, xi0)
         @test st.position isa NamedTuple
         @test keys(st.position) == (:mean, :logstd)
         # mean-field: the residual buffer is latent-shaped white noise (n_samples, latent).
         @test st.residuals isa AbstractArray
         @test size(st.residuals) == (128, D)
 
-        post = fit(MersenneTwister(0xfeed), mf, 3000)
+        post = fit(MersenneTwister(0xfeed), mf, xi0, 3000)
         # Mean-field recovers the exact posterior mean; its marginal σ is the
         # inverse-sqrt of the posterior PRECISION diagonal (it underestimates the
         # true marginal variance — a known property of mean-field).
@@ -1001,7 +1081,7 @@ end
         @test emp_var ≈ σ_expected .^ 2 rtol = 0.2
 
         # ── a NamedTuple-θ `step_vi!` moves BOTH leaves and threads the state ──
-        rng_s, s = init(MersenneTwister(123), mf)
+        rng_s, s = init(MersenneTwister(123), mf, xi0)
         mean0 = copy(s.position.mean)
         logstd0 = copy(s.position.logstd)
         step_vi!(rng_s, mf, s)
@@ -1009,13 +1089,18 @@ end
         @test s.position.logstd != logstd0
         @test s.optimizer_state !== nothing
 
-        # ── guards: mean-field needs an Optimisers rule and n_samples > 0 ──
+        # ── guards: mean-field needs an Optimisers rule (checked at construction) and
+        #    n_samples > 0 (structured-θ check, now enforced at `init`) ──
         @test_throws ArgumentError VariationalProblem(
-            lh, xi0; family = MeanFieldGaussian(), optimizer = NewtonCG()
+            lh; family = MeanFieldGaussian(), optimizer = NewtonCG()
         )
-        @test_throws ArgumentError VariationalProblem(
-            lh, xi0; family = MeanFieldGaussian(),
-            estimator = MCEstimator(n_samples = 0), optimizer = Optimisers.Adam(0.05),
+        @test_throws ArgumentError init(
+            MersenneTwister(0xfeed),
+            VariationalProblem(
+                lh; family = MeanFieldGaussian(),
+                estimator = MCEstimator(n_samples = 0), optimizer = Optimisers.Adam(0.05),
+            ),
+            xi0,
         )
     end
 
@@ -1047,18 +1132,18 @@ end
         lh = compose(GaussianLikelihood(setup.data; precision = setup.precision), ξ -> setup.A * ξ)
 
         problem = VariationalProblem(
-            lh, zeros(D);
+            lh;
             family = ScalarScaleGaussian(),
             estimator = MCEstimator(n_samples = 64, mirrored = true),
             optimizer = Optimisers.Adam(0.05),
         )   # no solver, no metric — the default `draw_samples!` supplies white noise.
 
         # Init allocates the latent-shaped residual buffer (white noise; no metric tangent).
-        rng_i, st = init(MersenneTwister(0x01), problem)
+        rng_i, st = init(MersenneTwister(0x01), problem, zeros(D))
         @test st.position isa NamedTuple && keys(st.position) == (:mean, :logs)
         @test st.residuals isa AbstractArray && size(st.residuals) == (64, D)
 
-        post = fit(MersenneTwister(0x01), problem, 3000)
+        post = fit(MersenneTwister(0x01), problem, zeros(D), 3000)
         @test post isa ScalarScaleDist
         @test post.mean ≈ setup.μ_post atol = 0.05 rtol = 0.0
         # draw fresh samples from the fitted custom distribution
@@ -1167,8 +1252,7 @@ end
 
             n_samples = 128
             problem = VariationalProblem(
-                lh,
-                xi0_r;
+                lh;
                 family = MGVIFamily(solver = ConjugateGradient(rtol = 1.0f-6, maxiter = 200)),
                 divergence = ReverseKL(),
                 estimator = MCEstimator(n_samples = n_samples, mirrored = true),
@@ -1177,12 +1261,12 @@ end
             )
 
             # init wraps the host RNG into a ReactantRNG for the compiled path.
-            rng, state = init(MersenneTwister(0xfeed), problem)
+            rng, state = init(MersenneTwister(0xfeed), problem, xi0_r)
             @test rng isa Reactant.ReactantRNG
 
             # `fit` compiles `step_vi!` once (via `_run_vi!(::AutoReactant,...)`)
             # and loops the compiled thunk.
-            post = fit(MersenneTwister(0xfeed), problem, 8)
+            post = fit(MersenneTwister(0xfeed), problem, xi0_r, 8)
             @test post isa FisherGaussianDistribution
             position_host = Array(_post_mean(post))
             @test position_host ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
@@ -1191,7 +1275,7 @@ end
             # CPU path above, so here we only check the fitted mean.)
 
             # The user can compile `step_vi!` themselves and loop the compiled thunk.
-            rng2, state2 = init(MersenneTwister(0xfeed), problem)
+            rng2, state2 = init(MersenneTwister(0xfeed), problem, xi0_r)
             cstep = Reactant.@compile step_vi!(rng2, problem, state2)
             for _ in 1:8
                 cstep(rng2, problem, state2)
@@ -1207,18 +1291,18 @@ end
             # must advance and recover the posterior moments.
             xi0_mf = Reactant.to_rarray(zeros(Float32, D))
             mf_problem = VariationalProblem(
-                lh, xi0_mf;
+                lh;
                 family = MeanFieldGaussian(),
                 divergence = ReverseKL(),
                 estimator = MCEstimator(n_samples = n_samples, mirrored = true),
                 optimizer = Optimisers.Adam(0.05),
                 adtype = GeoVI.ADTypes.AutoEnzyme(),
             )
-            rng_mf, state_mf = init(MersenneTwister(0xabcd), mf_problem)
+            rng_mf, state_mf = init(MersenneTwister(0xabcd), mf_problem, xi0_mf)
             @test state_mf.position isa NamedTuple   # generic θ container under Reactant
             @test keys(state_mf.position) == (:mean, :logstd)
 
-            mf_post = fit(MersenneTwister(0xabcd), mf_problem, 3000)
+            mf_post = fit(MersenneTwister(0xabcd), mf_problem, xi0_mf, 3000)
             σ_expected = 1 ./ sqrt.(diag(I + setup.A' * Diagonal(setup.precision) * setup.A))
             @test mf_post isa DiagonalGaussian
             @test Array(_post_mean(mf_post)) ≈ Float32.(setup.μ_post) atol = 0.2 rtol = 0.0
@@ -1230,7 +1314,7 @@ end
             # that the updated Adam moments actually reach the host `VIState`
             # between compiled calls instead of being silently frozen at zero —
             # a failure the moment-recovery tolerances above would NOT catch.
-            rng_os, state_os = init(MersenneTwister(0x7777), mf_problem)
+            rng_os, state_os = init(MersenneTwister(0x7777), mf_problem, xi0_mf)
             cstep_os = Reactant.@compile step_vi!(rng_os, mf_problem, state_os)
             adam_m(s) = Array(s.optimizer_state.tree.mean.state[1])  # Adam 1st moment, mean leaf
             m0 = adam_m(state_os)

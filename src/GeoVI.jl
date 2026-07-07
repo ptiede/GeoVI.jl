@@ -34,6 +34,8 @@ export logdensity_unnormalized, log_importance_ratio, pareto_diagnostic
 export MetricSample,
     ConjugateGradientInfo,
     ConjugateGradient,
+    JacobiPreconditioner,
+    DeflationPreconditioner,
     solve,
     LinearResidualDraw,
     NonlinearResidualUpdate,
@@ -43,6 +45,7 @@ export AbstractVariationalFamily,
     GeoVIFamily,
     MGVIFamily,
     MeanFieldGaussian,
+    ScaledMGVI,
     AbstractFDivergence,
     ReverseKL,
     AbstractOptimizer,
@@ -72,6 +75,7 @@ include("families/mgvi.jl")
 include("families/geovi.jl")
 include("families/fisher_gaussian.jl")
 include("families/meanfield.jl")
+include("families/scaledmgvi.jl")
 include("vi.jl")
 include("nonlinear.jl")
 include("psis.jl")

@@ -10,74 +10,51 @@ abstract type AbstractFDivergence end
 struct ReverseKL <: AbstractFDivergence end
 struct ForwardKL <: AbstractFDivergence end
 
-# The problem input is a *position* only. `step_vi!` redraws the residuals at the start
-# of every step, so initial residuals could never influence a fit — accepting them would
-# only invite `update!`-before-`draw_samples!` misuse.
-function _problem_samples(samples::Samples)
-    samples.residuals === nothing || throw(
-        ArgumentError(
-            "the initial `Samples` must not carry residuals — `step_vi!` redraws them " *
-                "at the start of every step, so they would never be used; pass the " *
-                "position alone",
-        ),
-    )
-    return samples
-end
-_problem_samples(position::AbstractArray) = Samples(position, nothing; keys = nothing)
 
 """
-    VariationalProblem(lh, position_or_samples; family, divergence, estimator, optimizer, adtype)
+    VariationalProblem(lh; family, divergence, estimator, optimizer, adtype)
 
 Bundle a likelihood with the four orthogonal VI axes (`family`, `divergence`,
-`estimator`, `optimizer`) plus the AD backend. `position_or_samples` is the
-initial latent point `ξ₀` (a flat white array) or a [`Samples`](@ref) whose
-`position` is `ξ₀` (and whose residuals must be `nothing` — [`step_vi!`](@ref)
-redraws the sample set at the start of every step, so initial residuals could
-never be used).
+`estimator`, `optimizer`) plus the AD backend. This is the *model* only — the
+starting point `ξ₀` is supplied at run time to [`init`](@ref) / [`fit`](@ref),
+not baked into the problem.
 
-Every construction path validates the axis combination (`NewtonCG` requires a
-natural-gradient family; structured-θ families require `n_samples > 0`; only
-`ReverseKL` is implemented).
+Construction validates the axis-only combination (`NewtonCG` requires a
+natural-gradient family; only `ReverseKL` is implemented); the `n_samples == 0`
++ structured-θ check needs `ξ₀` and so runs in [`init`](@ref).
 
 !!! note "AD backend cost"
     The default `adtype = AutoFiniteDiff()` needs no extra packages but costs
     `2·length(ξ₀)` objective evaluations per gradient — each an `n_samples`
     Monte-Carlo sum over the forward model. For anything beyond toy problems
-    load Enzyme and pass `adtype = AutoEnzyme()` (inferred as `AutoReactant`
-    automatically for Reactant arrays).
+    load Enzyme and pass `adtype = AutoEnzyme()`, or `adtype = AutoReactant()`
+    for the compiled Reactant path. (`adtype` is explicit — it is no longer
+    inferred from `ξ₀`'s array type, since `ξ₀` is not part of the problem.)
 """
-struct VariationalProblem{L, S, F, D, E, O, AD}
+struct VariationalProblem{L, F, D, E, O, AD}
     likelihood::L
-    initial_samples::S
     family::F
     divergence::D
     estimator::E
     optimizer::O
     adtype::AD
 
-    function VariationalProblem(lh, position_or_samples, family, divergence, estimator, optimizer, adtype)
-        samples = _problem_samples(position_or_samples)
+    function VariationalProblem(lh, family, divergence, estimator, optimizer, adtype)
         # Validation is host-only: under a Reactant trace the problem may be
         # reconstructed with traced fields, where re-validating is wasted work.
-        within_compile() ||
-            _require_supported(family, divergence, estimator, optimizer, samples.position)
+        within_compile() || _require_supported(family, divergence, estimator, optimizer)
         return new{
-            typeof(lh), typeof(samples), typeof(family), typeof(divergence),
+            typeof(lh), typeof(family), typeof(divergence),
             typeof(estimator), typeof(optimizer), typeof(adtype),
-        }(lh, samples, family, divergence, estimator, optimizer, adtype)
+        }(lh, family, divergence, estimator, optimizer, adtype)
     end
 end
 
+# Utility (no longer auto-applied): infer a Reactant-aware adtype from an array type.
 _infer_adtype(adtype, x) = adtype
 
-function _problem_adtype(adtype, samples::Samples)
-    samples.position === nothing && return adtype
-    return _infer_adtype(adtype, samples.position)
-end
-
 function VariationalProblem(
-        lh::AbstractLikelihood,
-        position_or_samples;
+        lh::AbstractLikelihood;
         family::AbstractVariationalFamily = GeoVIFamily(),
         divergence::AbstractFDivergence = ReverseKL(),
         estimator::AbstractEstimator = MCEstimator(),
@@ -85,16 +62,7 @@ function VariationalProblem(
         adtype = ADTypes.AutoFiniteDiff(),
     )
     adtype === nothing && (adtype = ADTypes.AutoFiniteDiff())
-    samples = _problem_samples(position_or_samples)
-    return VariationalProblem(
-        lh,
-        samples,
-        family,
-        divergence,
-        estimator,
-        optimizer,
-        _problem_adtype(adtype, samples),
-    )
+    return VariationalProblem(lh, family, divergence, estimator, optimizer, adtype)
 end
 
 _n_base_draws(problem::VariationalProblem) = _n_base_draws(problem.estimator)
@@ -142,18 +110,16 @@ _init_optimizer_state(problem::VariationalProblem, position) =
     _optimizer_state(problem.optimizer, position, nothing)
 
 """
-    init([rng], problem[, ξ0]) -> (rng, state)
+    init([rng], problem, ξ0) -> (rng, state)
 
-Allocate the [`VIState`](@ref) for `problem` — a fresh copy of the initial
-position, the residual buffer, and the optimizer state — and return it together
-with the loop RNG to thread through [`step_vi!`](@ref).
+Allocate the [`VIState`](@ref) for `problem` at the starting point `ξ0` — the
+variational parameters `θ = init_params(family, ξ0)`, the residual buffer, and the
+optimizer state — and return it with the loop RNG to thread through [`step_vi!`](@ref).
 
-`ξ0` optionally overrides the problem's initial latent point
-(`problem.initial_samples.position`); it is the **starting latent point** (for
-MGVI/geoVI the mean the optimizer starts from, for mean-field the seed for
-`(; mean = ξ0, logstd = 0)`). This is how you restart from a new point without
-rebuilding the `problem`. To restart an *existing* state in place (reusing its
-buffers), use [`reset!`](@ref) instead.
+`ξ0` is the **starting θ** the family consumes: for MGVI/geoVI the latent mean the
+optimizer starts from; for mean-field the seed for `(; mean = ξ0, logstd = 0)`; for
+`ScaledMGVI` the full `[μ; logscale]` (build it with `GeoVI.scaled_init`). To restart
+an *existing* state in place (reusing its buffers) use [`reset!`](@ref) instead.
 
 `rng` is first-positional or auto-generated (`Random.default_rng()`); it is never
 a keyword. For an `AutoReactant` problem the RNG is wrapped into a
@@ -163,24 +129,40 @@ user calling `@compile step_vi!(...)`).
 The residual buffer starts zero-filled; [`step_vi!`](@ref) redraws it at the
 start of every step.
 """
-function init(rng::AbstractRNG, problem::VariationalProblem, ξ0 = nothing)
-    # All buffers are sized from the latent point ξ₀ (latent-shaped by
-    # construction), so the interface needs no `θ → latent` projection.
-    latent = something(ξ0, problem.initial_samples.position)
-    θ = init_params(problem.family, latent)
-    residuals = _init_residual_buffer(problem, latent)
+init(rng::AbstractRNG, problem::VariationalProblem, ξ0) =
+    _init_state(rng, problem, init_params(problem.family, ξ0))
+init(problem::VariationalProblem, ξ0) = init(Random.default_rng(), problem, ξ0)
+
+# No-ξ0 convenience: the family's RANDOM default θ (`default_params`), sized/typed from the
+# likelihood's `default_latent`. Errors helpfully if the likelihood defines no `default_latent`
+# (toy likelihoods) — pass `ξ0` explicitly there.
+init(rng::AbstractRNG, problem::VariationalProblem) =
+    _init_state(rng, problem,
+        default_params(rng, problem.family, problem.adtype, default_latent(problem.likelihood)))
+init(problem::VariationalProblem) = init(Random.default_rng(), problem)
+
+# Shared state allocation from a fully-built θ (the only difference between the ξ0 and no-ξ0
+# `init` paths is how θ is produced).
+function _init_state(rng::AbstractRNG, problem::VariationalProblem, θ)
+    _require_init_supported(problem.family, problem.estimator, θ)
+    # Size the metric-residual buffer from the LATENT part of θ (the mean), not the full
+    # parameter container: a ScaledMGVI θ also carries `logscale`, but the residual r is a
+    # latent-shaped metric draw. For MGVI/mean-field this is the mean already.
+    residuals = _init_residual_buffer(problem, _latent_ref(problem.family, θ))
     optimizer_state = _init_optimizer_state(problem, θ)
     wrapped_rng = _wrap_rng(problem.adtype, rng)
     return wrapped_rng, VIState(θ, residuals, optimizer_state)
 end
 
-init(problem::VariationalProblem) = init(Random.default_rng(), problem)
-init(problem::VariationalProblem, ξ0) = init(Random.default_rng(), problem, ξ0)
-
 # Latent-sized reference array inside a θ container, for reset!'s size check.
 # Array families: θ *is* the latent. Mean-field: θ.mean is latent-sized.
 _latent_ref(θ::AbstractArray) = θ
 _latent_ref(θ) = first(values(θ))
+# Family-aware form: a family whose θ is a flat array bundling extra parameters (ScaledMGVI:
+# `[μ; logscale]`) overrides this to return just the latent (mean) block — the metric-residual
+# / reset! shape. The default defers to the structural `_latent_ref(θ)` (MGVI: θ; mean-field:
+# θ.mean), so existing families are unchanged.
+_latent_ref(::AbstractVariationalFamily, θ) = _latent_ref(θ)
 
 """
     reset!(state, problem, ξ0) -> state
@@ -197,15 +179,18 @@ is reset to fresh (momentum cleared).
 matching [`update!`](@ref)'s per-step behavior. `ξ0` must match the existing
 latent size — `reset!` cannot resize; call [`init`](@ref) for a different size.
 """
-function reset!(state::VIState, problem::VariationalProblem, ξ0::AbstractArray)
-    ref = _latent_ref(state.position)
-    size(ref) == size(ξ0) || throw(
+function reset!(state::VIState, problem::VariationalProblem, ξ0)
+    # Rebuild θ from ξ0 (a latent array, a `(mean, logscale)` seed, …) then compare the LATENT
+    # (mean) block of the rebuilt θ against the state's — uniform across families and ξ0 forms.
+    θ_new = init_params(problem.family, ξ0)
+    ref = _latent_ref(problem.family, state.position)
+    new_ref = _latent_ref(problem.family, θ_new)
+    size(ref) == size(new_ref) || throw(
         DimensionMismatch(
-            "reset! cannot resize: state latent size $(size(ref)), new ξ0 size " *
-                "$(size(ξ0)). Use `init` to allocate a fresh state of the new size."
+            "reset! cannot resize: state latent size $(size(ref)), new latent size " *
+                "$(size(new_ref)). Use `init` to allocate a fresh state of the new size."
         ),
     )
-    θ_new = init_params(problem.family, ξ0)
     # Leaf-wise in-place copy preserves position-buffer identity (cf. `update!`);
     # for a bare-array θ this is exactly `copyto!(state.position, θ_new)`.
     fmap(copyto!, state.position, θ_new)
@@ -441,12 +426,12 @@ end
 
 # ── Outer position update ──────────────────────────────────────────────────
 
+# Axis-only validation, run at construction (no ξ₀ needed).
 function _require_supported(
         family::AbstractVariationalFamily,
         divergence::AbstractFDivergence,
         estimator::AbstractEstimator,
         optimizer,
-        position,
     )
     divergence isa ReverseKL || throw(
         ArgumentError(
@@ -470,15 +455,18 @@ function _require_supported(
             ),
         )
     end
-    # With no samples the objective degenerates to the negative log-posterior at θ
-    # (MAP), which is only defined when θ is itself the latent point. A structured-θ
-    # family (NamedTuple parameters, e.g. mean-field) therefore needs samples.
-    if _n_stored_samples(estimator) == 0 && position !== nothing
-        θ0 = init_params(family, position)
-        θ0 isa AbstractArray || throw(
+    return nothing
+end
+
+# ξ₀-dependent validation, run in `init` once θ is built. With no samples the objective
+# degenerates to the negative log-posterior at θ (MAP), which is only defined when θ is
+# itself the latent point; a structured-θ family (e.g. mean-field's NamedTuple) needs samples.
+function _require_init_supported(family::AbstractVariationalFamily, estimator::AbstractEstimator, θ)
+    if _n_stored_samples(estimator) == 0
+        θ isa AbstractArray || throw(
             ArgumentError(
                 "`$(nameof(typeof(family)))` has structured parameters " *
-                    "(θ::$(typeof(θ0)) is not the latent point), so the sample-free MAP " *
+                    "(θ::$(typeof(θ)) is not the latent point), so the sample-free MAP " *
                     "objective is undefined for it; use an estimator with `n_samples > 0`.",
             ),
         )
@@ -539,7 +527,7 @@ against that fixed set. `rng` is advanced in place; `problem` is the immutable c
 you compile it yourself and call the compiled thunk in your loop:
 
 ```julia
-rng, state = init(rng, problem)
+rng, state = init(rng, problem, ξ0)
 cstep = @compile step_vi!(rng, problem, state)
 for _ in 1:n; cstep(rng, problem, state); end
 ```
@@ -569,13 +557,23 @@ Convenience driver: run `n_iterations` of [`step_vi!`](@ref) and return the fitt
 variational distribution ([`distribution`](@ref)). Under Reactant it compiles `step_vi!`
 once and loops the compiled thunk. `rng` defaults to `Random.default_rng()`.
 """
+function fit(rng::AbstractRNG, problem::VariationalProblem, ξ0, n_iterations::Integer)
+    n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))
+    rng, state = init(rng, problem, ξ0)
+    _run_vi!(problem.adtype, rng, problem, state, n_iterations)
+    return distribution(problem, state)
+end
+
+fit(problem::VariationalProblem, ξ0, n_iterations::Integer) =
+    fit(Random.default_rng(), problem, ξ0, n_iterations)
+
+# No-ξ0 convenience: uses the likelihood's `default_latent` (see `init`).
 function fit(rng::AbstractRNG, problem::VariationalProblem, n_iterations::Integer)
     n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))
     rng, state = init(rng, problem)
     _run_vi!(problem.adtype, rng, problem, state, n_iterations)
     return distribution(problem, state)
 end
-
 fit(problem::VariationalProblem, n_iterations::Integer) =
     fit(Random.default_rng(), problem, n_iterations)
 

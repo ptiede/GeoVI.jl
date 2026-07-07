@@ -49,6 +49,19 @@ abstract type AbstractVariationalFamily end
 # Build θ from the user's initial latent point.
 init_params(::AbstractVariationalFamily, initial_latent) = copy(initial_latent)
 
+# Random default θ for the no-ξ₀ `init`/`fit` path. The default draws a standard-normal prior
+# sample in the latent (the standardized space) and expands it to the family's θ via
+# `init_params` (MGVI: the draw itself; mean-field: mean = draw, logstd = 0; ScaledMGVI: [draw;
+# 0]). A family may override to fill its parameters differently. The random latent is allocated
+# on the problem's backend by dispatching `_random_latent` on `adtype` (host vs Reactant device).
+default_params(rng, family::AbstractVariationalFamily, adtype, latent_proto) =
+    init_params(family, _random_latent(rng, adtype, latent_proto))
+
+# Standard-normal prior draw sized/typed from `latent_proto` (= `default_latent(lh)`), on the
+# backend implied by `adtype`. Host default; the Reactant extension overrides for `AutoReactant`
+# to return a device array.
+_random_latent(rng, adtype, latent_proto) = randn_like(rng, latent_proto)
+
 # Reconstruct a latent point ξ from θ + one stored residual, AND return the
 # reparameterization's log-Jacobian `log|det J|` — the variational entropy term, so the
 # reverse-KL objective is `mean_i[-log p(ξ_i) - logjac_i]`. Returns `(ξ, logjac)`, both

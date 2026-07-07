@@ -31,6 +31,24 @@ function leftsqrtmetric end
 function rightsqrtmetric end
 function fishermetric end
 
+"""
+    default_latent(lh) -> ξ
+
+A default starting latent point for `lh` — a zero array of the model's latent size and
+element type (so it carries the right array type, e.g. a Reactant `rarray`). Lets `init` /
+`fit` be called without an explicit `ξ0`. Optional: only likelihoods that know their latent
+space implement it (e.g. `geovi_likelihood` from its transported posterior). The fallback
+errors, directing the caller to pass `ξ0` explicitly.
+"""
+function default_latent(lh::AbstractLikelihood)
+    throw(
+        ArgumentError(
+            "`$(nameof(typeof(lh)))` defines no `GeoVI.default_latent`, so `init`/`fit` need an " *
+                "explicit starting point — call `init(rng, problem, ξ0)` / `fit(rng, problem, ξ0, n)`.",
+        ),
+    )
+end
+
 (lh::AbstractLikelihood)(y) = logdensity(lh, y)
 
 energy(lh::AbstractLikelihood, y) = -logdensity(lh, y)

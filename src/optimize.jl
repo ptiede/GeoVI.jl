@@ -440,6 +440,7 @@ function _newton_cg_iter(
         active, x, value, grad, status, iterations, converged,
         objective_evaluations, hessian_evaluations, line_search_steps,
         cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, prev_value, iteration,
+        preconditioner,
     )
     # Eisenstat–Walker forcing sequence (inexact Newton): solve the Newton
     # system only as tightly as the current gradient warrants. Far from the
@@ -473,7 +474,7 @@ function _newton_cg_iter(
     # Pin the metric at the current `x` ONCE per Newton iteration; the inner CG
     # applies it every matvec and the line search once more for curvature.
     metric_op = metricp(x)
-    step, cg_info = solve(cg, metric_op, grad; threshold = forcing, absdelta = cg_absdelta)
+    step, cg_info = solve(cg, metric_op, grad; threshold = forcing, absdelta = cg_absdelta, preconditioner = preconditioner)
     cg_ok = !cg_info.breakdown
     cg_iters = cg_info.iterations
 
@@ -544,6 +545,7 @@ function _optimize(
         cg_miniter::Integer = 0,
         stepnorm = norm,
         optimizer_state = nothing,
+        preconditioner = nothing,
     )
     maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
@@ -552,6 +554,12 @@ function _optimize(
     # `length(x0)` is static (a plain `Int`, even under Reactant tracing), so the
     # resulting `absdelta` is a compile-time-known number.
     absdelta = absdelta === nothing && delta !== nothing ? delta * length(x0) : absdelta
+    # NIFTy.re scales the step-norm tolerance by the number of latent d.o.f.
+    # (`_newton_cg`: `xtol = xtol * size(x0)`): the descent norm is a sum/√sum over
+    # the latent dimensions, so an unscaled `xtol` is ~√D too tight on a large
+    # problem and the optimizer never early-stops (it grinds to `maxiter`, which on
+    # a stochastic MC objective overfits the sample noise). `length(x0)` is static.
+    xtol = xtol * length(x0)
 
     x = x0
     value, grad = fun_and_grad(x)
@@ -607,6 +615,7 @@ function _optimize(
             active, x, value, grad, status, iterations, converged,
             objective_evaluations, hessian_evaluations, line_search_steps,
             cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, prev_value, iteration,
+            preconditioner,
         )
     end
 
@@ -640,9 +649,10 @@ function _optimize(
         cg_miniter::Integer = 0,
         stepnorm = norm,
         optimizer_state = nothing,
+        preconditioner = nothing,
     )
-    # `delta`/CG keywords are accepted for a uniform call signature but unused by
-    # a first-order rule (no inner CG, no energy-decrease criterion).
+    # `delta`/CG keywords (and `preconditioner`) are accepted for a uniform call
+    # signature but unused by a first-order rule (no inner CG, no energy criterion).
     maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
 

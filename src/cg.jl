@@ -32,25 +32,31 @@ function _check_conv(iteration, miniter, res_norm, tol)
     return keep_going, converged
 end
 
-function _cg_step(denom, rr, x, r, p, Ap)
+# Preconditioned CG step. The loop-carried scalar is `rz = ⟨r, M⁻¹r⟩` (the
+# preconditioned inner product); the convergence norm is the TRUE residual
+# `‖r‖`. With `Minv = identity` (the default) `z = r`, `rz = ⟨r,r⟩`, and every
+# line below reduces to the plain-CG recurrence — bit-for-bit. `z` is transient
+# (recomputed from `r_new` each step), so it is never carried across iterations.
+function _cg_step(denom, rz, x, r, p, Ap, Minv)
     x_new = x
     r_new = r
     p_new = p
-    rr_new = rr
-    residual_norm = sqrt(rr)
+    rz_new = rz
+    residual_norm = sqrt(real(dot(r, r)))
 
     valid_step, breakdown = _check_denom(denom)
     @trace if valid_step
-        α = rr / denom
+        α = rz / denom
         x_new = x .+ α .* p
         r_new = r .- α .* Ap
-        rr_new = real(dot(r_new, r_new))
-        residual_norm = sqrt(rr_new)
-        β = rr_new / rr
-        p_new = r_new .+ β .* p
+        z_new = Minv(r_new)
+        rz_new = real(dot(r_new, z_new))
+        residual_norm = sqrt(real(dot(r_new, r_new)))
+        β = rz_new / rz
+        p_new = z_new .+ β .* p
     end
 
-    return x_new, r_new, p_new, rr_new, residual_norm, valid_step, breakdown
+    return x_new, r_new, p_new, rz_new, residual_norm, valid_step, breakdown
 end
 
 struct ConjugateGradient
@@ -91,12 +97,12 @@ end
 _tol_or_zero(tol) = tol === nothing ? 0.0 : float(tol)
 
 function _cg_iterate(
-        operator, b, rr, x, r, p, iteration, breakdown, miniter, ad_miniter, threshold, absdelta,
-        energy,
+        operator, b, rz, x, r, p, iteration, breakdown, miniter, ad_miniter, threshold, absdelta,
+        energy, Minv,
     )
     Ap = operator(p)
     denom = real(dot(p, Ap))
-    x, r, p, rr, residual_norm, valid_step, breakdown_step = _cg_step(denom, rr, x, r, p, Ap)
+    x, r, p, rz, residual_norm, valid_step, breakdown_step = _cg_step(denom, rz, x, r, p, Ap, Minv)
     iteration += ifelse(valid_step, 1, 0)
     breakdown = breakdown | breakdown_step
     keep_going, converged = _check_conv(iteration, miniter, residual_norm, threshold)
@@ -113,20 +119,25 @@ function _cg_iterate(
         end
     end
     keep_going = valid_step & keep_going
-    return rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm, new_energy
+    return rz, x, r, p, iteration, keep_going, converged, breakdown, residual_norm, new_energy
 end
 
-function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold, absdelta; x0 = nothing)
+function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold, absdelta; x0 = nothing, preconditioner = nothing)
+    # `Minv` applies the preconditioner `M⁻¹` (≈ A⁻¹) to a residual. The default
+    # `identity` is plain CG: `z = r`, `rz = ⟨r,r⟩`, and the recurrence below is
+    # unchanged. A Jacobi preconditioner passes `v -> v ./ diag(A)`.
+    Minv = preconditioner === nothing ? identity : preconditioner
     x = x0 === nothing ? zero(b) : copy(x0)
     r = b .- operator(x)
-    p = copy(r)
+    z = Minv(r)
+    p = copy(z)
 
-    rr = real(dot(r, r))
-    residual_norm = sqrt(rr)
+    rz = real(dot(r, z))
+    residual_norm = sqrt(real(dot(r, r)))
     # Initial CG quadratic energy; only needed when the `absdelta` criterion is
     # active (the `dot` is skipped otherwise — see `_cg_iterate`). The
     # `=== nothing` guard is a compile-time type check, not a traced branch.
-    energy = absdelta === nothing ? zero(rr) : -0.5 * real(dot(x, b .+ r))
+    energy = absdelta === nothing ? zero(rz) : -0.5 * real(dot(x, b .+ r))
     # Minimum iterations before the `absdelta` energy criterion may fire
     # (NIFTy.re uses `min(6, maxiter)`); honours a larger user `miniter`.
     ad_miniter = max(miniter, min(6, maxiter))
@@ -153,10 +164,10 @@ function _cg_run(operator, b, maxiter::Int, miniter::Int, threshold, absdelta; x
     end
 
     @trace track_numbers = false while keep_going & (iteration < maxiter)
-        rr, x, r, p, iteration, keep_going, converged, breakdown, residual_norm, energy =
+        rz, x, r, p, iteration, keep_going, converged, breakdown, residual_norm, energy =
             _cg_iterate(
-            operator, b, rr, x, r, p, iteration, breakdown, miniter, ad_miniter, threshold,
-            absdelta, energy,
+            operator, b, rz, x, r, p, iteration, breakdown, miniter, ad_miniter, threshold,
+            absdelta, energy, Minv,
         )
     end
     return x, _cg_info(
@@ -175,7 +186,7 @@ end
 @inline _maybe_traced(x) = ReactantCore.within_compile() ?
     ReactantCore.promote_to_traced(x) : x
 
-function solve(cg::ConjugateGradient, operator, b; x0 = nothing, threshold = nothing, absdelta = nothing)
+function solve(cg::ConjugateGradient, operator, b; x0 = nothing, threshold = nothing, absdelta = nothing, preconditioner = nothing)
     miniter = cg.miniter
     # Default iteration cap when `maxiter` is unset, matching NIFTy.re's `_cg`
     # (conjugate_gradient.py): `maxiter = max(min(200, 20·D), miniter)`. ONE cap for both
@@ -192,5 +203,5 @@ function solve(cg::ConjugateGradient, operator, b; x0 = nothing, threshold = not
     # overrides the static field; `nothing` (either source) disables the energy
     # criterion via the compile-time `=== nothing` guards in `_cg_run`.
     ad = absdelta === nothing ? cg.absdelta : absdelta
-    return _cg_run(operator, b, maxiter, miniter, thr, ad; x0 = x0)
+    return _cg_run(operator, b, maxiter, miniter, thr, ad; x0 = x0, preconditioner = preconditioner)
 end
