@@ -425,7 +425,7 @@ end
         # basis and a spread stiff cluster 1e4…1e8 over a benign bulk. Jacobi can't
         # help (off-diagonal coupling); a rank-`k` deflation collapses κ to the bulk.
         Dd = 120; k = 12
-        rng = MersenneTwister(0xdef)
+        rng = MersenneTwister(0x0def)
         Vf = Matrix(qr(randn(rng, Dd, Dd)).Q)
         λstiff = exp.(range(log(1.0e4), log(1.0e8), length = k))
         λbulk = exp.(range(log(1.0), log(8.0), length = Dd - k))

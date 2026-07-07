@@ -206,9 +206,9 @@ end
 GeoVI.init_params(::GeoVI.ScaledMGVI, μ::Reactant.ConcreteRArray) =
     Reactant.to_rarray(GeoVI.scaled_init(Array(μ)))
 GeoVI.init_params(
-        ::GeoVI.ScaledMGVI,
-        θ0::NamedTuple{names, <:Tuple{<:Reactant.ConcreteRArray, <:Reactant.ConcreteRArray}},
-    ) where {names} =
+    ::GeoVI.ScaledMGVI,
+    θ0::NamedTuple{names, <:Tuple{<:Reactant.ConcreteRArray, <:Reactant.ConcreteRArray}},
+) where {names} =
     Reactant.to_rarray(GeoVI.scaled_init(Array(θ0.mean), Array(θ0.logscale)))
 
 # Random default latent on the device (no-ξ0 `init`/`fit`): draw on the host with the given rng

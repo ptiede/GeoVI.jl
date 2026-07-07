@@ -137,8 +137,10 @@ init(problem::VariationalProblem, ξ0) = init(Random.default_rng(), problem, ξ0
 # likelihood's `default_latent`. Errors helpfully if the likelihood defines no `default_latent`
 # (toy likelihoods) — pass `ξ0` explicitly there.
 init(rng::AbstractRNG, problem::VariationalProblem) =
-    _init_state(rng, problem,
-        default_params(rng, problem.family, problem.adtype, default_latent(problem.likelihood)))
+    _init_state(
+    rng, problem,
+    default_params(rng, problem.family, problem.adtype, default_latent(problem.likelihood))
+)
 init(problem::VariationalProblem) = init(Random.default_rng(), problem)
 
 # Shared state allocation from a fully-built θ (the only difference between the ξ0 and no-ξ0
