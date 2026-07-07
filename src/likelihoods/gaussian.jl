@@ -1,10 +1,10 @@
-struct GaussianLikelihood{D,P,S} <: AbstractLikelihood
+struct GaussianLikelihood{D, P, S} <: AbstractLikelihood
     data::D
     precision::P
     sqrt_precision::S
 end
 
-function GaussianLikelihood(data; precision=1, sqrt_precision=nothing)
+function GaussianLikelihood(data; precision = 1, sqrt_precision = nothing)
     sqrt_precision === nothing && (sqrt_precision = _infer_sqrt_precision(precision))
     return GaussianLikelihood(data, precision, sqrt_precision)
 end

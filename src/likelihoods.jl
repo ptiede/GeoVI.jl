@@ -42,6 +42,28 @@ function fishermetric(lh::AbstractLikelihood, y, v)
     return leftsqrtmetric(lh, y, rightsqrtmetric(lh, y, v))
 end
 
+# ── Likelihood pinned at a point ─────────────────────────────────────────────
+#
+# `_at_point(lh, x)` pins `lh` at the latent point `x` and returns a handle whose
+# 2-arg `fishermetric`/`leftsqrtmetric`/`rightsqrtmetric`/`transformation` reuse all
+# per-point work. This is the hot-path contract: a CG solve applies the metric many
+# times at one fixed point, so anything `x`-dependent (in particular the forward-model
+# linearization of `ComposedLikelihood`, see `likelihoods/composed.jl`) must be derived
+# once per point, not once per matvec. The fallback handle just closes over `(lh, x)` —
+# plain likelihoods have no per-point setup worth caching.
+struct _LikelihoodAtPoint{L, X}
+    lh::L
+    x::X
+end
+
+_at_point(lh::AbstractLikelihood, x) = _LikelihoodAtPoint(lh, x)
+
+_point(h::_LikelihoodAtPoint) = h.x
+fishermetric(h::_LikelihoodAtPoint, v) = fishermetric(h.lh, h.x, v)
+leftsqrtmetric(h::_LikelihoodAtPoint, η) = leftsqrtmetric(h.lh, h.x, η)
+rightsqrtmetric(h::_LikelihoodAtPoint, v) = rightsqrtmetric(h.lh, h.x, v)
+transformation(h::_LikelihoodAtPoint) = transformation(h.lh, h.x)
+
 _sum_logdensity(x) = real(sum(x))
 
 _infer_sqrt_precision(precision::Number) = sqrt(precision)
@@ -51,10 +73,10 @@ function _infer_sqrt_precision(precision::AbstractArray)
     ndims(precision) == 2 &&
         size(precision, 1) == size(precision, 2) &&
         throw(
-            ArgumentError(
-                "matrix precision requires an explicit `sqrt_precision` operator",
-            ),
-        )
+        ArgumentError(
+            "matrix precision requires an explicit `sqrt_precision` operator",
+        ),
+    )
     return sqrt.(precision)
 end
 function _infer_sqrt_precision(precision)
@@ -108,7 +130,7 @@ end
 function _validate_binomial_data(data, trials)
     _validate_nonnegative("trials", trials)
     ok = data isa Number && trials isa Number ? (0 <= data <= trials) :
-         all((0 .<= data) .& (data .<= trials))
+        all((0 .<= data) .& (data .<= trials))
     ok ||
         throw(ArgumentError("binomial successes must lie in `[0, trials]`"))
     return data, trials
@@ -118,18 +140,18 @@ function _unsupported_composed_adtype_message(adtype)
     return "automatic linearization is not available for `$(typeof(adtype))`; pass manual `linearize` or `pushforward`/`pullback` to `compose`, or choose a supported `adtype`."
 end
 
-function _directional_fd_step(x::AbstractArray, v::AbstractArray; relstep::Real=1e-6)
+function _directional_fd_step(x::AbstractArray, v::AbstractArray; relstep::Real = 1.0e-6)
     nv = norm(v)
     nv == 0 && return 0.0
     return relstep * max(1.0, norm(x)) / nv
 end
 
 function _finite_difference_pullback(
-    forward,
-    x::AbstractArray,
-    η::AbstractArray;
-    relstep::Real=1e-6,
-)
+        forward,
+        x::AbstractArray,
+        η::AbstractArray;
+        relstep::Real = 1.0e-6,
+    )
     relstep > 0 || throw(ArgumentError("`relstep` must be positive"))
 
     objective = z -> real(dot(forward(z), η))
@@ -152,13 +174,13 @@ end
 
 _infer_composed_adtype(adtype, x) = adtype
 
-struct _ManualLinearizer{F,PF,PB}
+struct _ManualLinearizer{F, PF, PB}
     forward::F
     pushforward::PF
     pullback::PB
 end
 
-struct _ManualLinearization{V,X,PF,PB}
+struct _ManualLinearization{V, X, PF, PB}
     value::V
     x::X
     pushforward::PF
@@ -173,7 +195,7 @@ function _evaluate_linearizer(linearize::_ManualLinearizer, x)
     return _ManualLinearization(linearize.forward(x), x, linearize.pushforward, linearize.pullback)
 end
 
-struct _FiniteDifferenceLinearization{F,X,V,T}
+struct _FiniteDifferenceLinearization{F, X, V, T}
     forward::F
     x::X
     value::V
@@ -207,7 +229,7 @@ function pullback(lin::_ManualLinearization, η::AbstractArray)
 end
 
 function pushforward(lin::_FiniteDifferenceLinearization, v::AbstractArray)
-    step = _directional_fd_step(lin.x, v; relstep=lin.fd_eps)
+    step = _directional_fd_step(lin.x, v; relstep = lin.fd_eps)
     step == 0 && return zero(lin.value)
     xp = similar(lin.x)
     xm = similar(lin.x)
@@ -217,7 +239,7 @@ function pushforward(lin::_FiniteDifferenceLinearization, v::AbstractArray)
 end
 
 function pullback(lin::_FiniteDifferenceLinearization, η::AbstractArray)
-    return _finite_difference_pullback(lin.forward, lin.x, η; relstep=lin.fd_eps)
+    return _finite_difference_pullback(lin.forward, lin.x, η; relstep = lin.fd_eps)
 end
 
 function _manual_linearize(forward, pushforward, pullback)
@@ -225,20 +247,20 @@ function _manual_linearize(forward, pushforward, pullback)
 end
 
 function _automatic_linearize(
-    ::ADTypes.AutoFiniteDiff,
-    forward,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
+        ::ADTypes.AutoFiniteDiff,
+        forward,
+        x::AbstractArray;
+        fd_eps::Real = 1.0e-6,
+    )
     return _FiniteDifferenceLinearization(forward, x, forward(x), fd_eps)
 end
 
 function _automatic_linearize(
-    ::ADTypes.NoAutoDiff,
-    forward,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
+        ::ADTypes.NoAutoDiff,
+        forward,
+        x::AbstractArray;
+        fd_eps::Real = 1.0e-6,
+    )
     throw(
         ArgumentError(
             "`NoAutoDiff()` disables automatic linearization; pass a manual `linearize` or `pushforward`/`pullback` to `compose`, or choose a concrete AD backend.",
@@ -247,11 +269,11 @@ function _automatic_linearize(
 end
 
 function _automatic_linearize(
-    adtype::ADTypes.AbstractADType,
-    forward,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
+        adtype::ADTypes.AbstractADType,
+        forward,
+        x::AbstractArray;
+        fd_eps::Real = 1.0e-6,
+    )
     throw(ArgumentError(_unsupported_composed_adtype_message(adtype)))
 end
 

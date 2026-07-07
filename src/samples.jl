@@ -1,10 +1,10 @@
-struct Samples{P<:Union{Nothing,AbstractArray},S<:Union{Nothing,AbstractArray},K}
+struct Samples{P <: Union{Nothing, AbstractArray}, S <: Union{Nothing, AbstractArray}, K}
     position::P
     residuals::S
     keys::K
 end
 
-Samples(position, residuals; keys=nothing) = Samples(position, residuals, keys)
+Samples(position, residuals; keys = nothing) = Samples(position, residuals, keys)
 
 function posterior_samples(samples::Samples)
     samples.residuals === nothing &&
@@ -17,7 +17,11 @@ _sample_count(residuals::AbstractArray) = size(residuals, 1)
 
 Base.length(samples::Samples) = samples.residuals === nothing ? 0 : _sample_count(samples.residuals)
 
-function _sample_slice(x::AbstractArray, i::Int)
+function _sample_slice(x::AbstractArray, i)
+    # Note: `i` is an integer-typed scalar. We omit a `::Integer`
+    # annotation because under `@trace for` it arrives as a
+    # `Reactant.TracedRNumber{<:Integer}`, which does not subtype
+    # `Integer`. The implementation is identical in either case.
     tail = ntuple(_ -> Colon(), max(ndims(x) - 1, 0))
     return x[i, tail...]
 end
@@ -36,13 +40,18 @@ function Base.getindex(samples::Samples, i::Int)
     return samples.position === nothing ? draw : draw .+ samples.position
 end
 
-function Base.iterate(samples::Samples, state::Int=1)
+function Base.iterate(samples::Samples, state::Int = 1)
     state > length(samples) && return nothing
     return (samples[state], state + 1)
 end
 
 function recenter(samples::Samples, new_position)
-    samples.residuals === nothing && return Samples(new_position, nothing; keys=samples.keys)
+    samples.residuals === nothing && return Samples(new_position, nothing; keys = samples.keys)
     shifted = posterior_samples(samples)
-    return Samples(new_position, _subtract_position(shifted, new_position); keys=samples.keys)
+    return Samples(new_position, _subtract_position(shifted, new_position); keys = samples.keys)
 end
+
+# The fitted variational distribution is `AbstractVariationalDistribution` (see
+# `src/families/`): `fit`/`distribution` return a per-family distribution object you draw
+# from with `rand`. `Samples` above is the internal expansion-point + residuals container
+# used during fitting (and returned by `draw_residuals`).

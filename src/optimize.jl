@@ -1,13 +1,22 @@
 _option(options, name::Symbol, default) =
     hasproperty(options, name) ? getproperty(options, name) : default
 
+# Fraction of the last outer Newton energy gain the inner CG is asked to reduce
+# its quadratic by, past the first iteration (NIFTy.re's `energy_reduction_factor`).
+# Only used when the optimizer carries an `absdelta`.
+const _CG_ENERGY_REDUCTION = 0.1
+
 """
     AbstractOptimizer
 
 Marker supertype for built-in optimizer backends.
 
 To add a new optimizer backend, subtype `AbstractOptimizer` and implement
-`_optimize(optimizer, x0; fun_and_grad, metricp, kwargs...)`. If the backend
+`_optimize(optimizer, x0; fun_and_grad, metricp, kwargs...)`. `metricp` is
+*curried*: `metricp(x)` returns the metric operator `v -> M(x)·v` at the point
+`x` — build it once per outer iteration and reuse it for every application
+(inner CG matvecs, line-search curvature), since constructing it may pin
+expensive per-point work such as a forward-model linearization. If the backend
 needs persistent state across VI iterations, also implement
 `_optimizer_state(optimizer, x0, previous_result)`.
 
@@ -15,9 +24,83 @@ Any `Optimisers.AbstractRule` is also accepted directly without subtyping
 `AbstractOptimizer`.
 """
 abstract type AbstractOptimizer end
-struct NewtonCG <: AbstractOptimizer end
 
-struct OptimizationResult{OPT,S,X,C,K,ST,V,G,I,OE,HE,LS}
+"""
+    NewtonCG(; maxiter=20, miniter=0, xtol=1e-5, absdelta=nothing,
+               cg_rtol=nothing, cg_atol=nothing, cg_maxiter=nothing, cg_miniter=0)
+
+Inexact Newton optimizer whose inner linear system is solved by conjugate
+gradient. The inner solve is governed by an Eisenstat–Walker forcing sequence:
+each Newton system is solved only as tightly as the current gradient warrants
+(residual target `min(0.5, √‖g‖)·‖g‖`). `cg_rtol`/`cg_atol` default to
+`nothing` (forcing alone); when set they act as a *floor* on the inner residual
+target — `threshold = max(forcing, max(cg_atol, cg_rtol·‖g‖))` — capping how
+tightly CG solves (a guard against over-solving near the optimum). They never
+*tighten* the forcing: setting `cg_rtol` will not force a tight inner solve far
+from the optimum (doing so via `min` was a large per-step regression). To spend
+*more* inner effort, lower `cg_rtol`; to spend *less*, raise it or use
+`cg_maxiter` / the energy coupling below.
+
+Energy-based convergence is opt-in via either `absdelta` (an absolute
+energy-decrease tolerance) or `delta` (the *per-degree-of-freedom* tolerance,
+which becomes `absdelta = delta · length(x0)` at solve time, since the energy is
+a sum over the latent dimensions — cf. NIFTy.re's `delta` convenience). Setting
+`delta` is the easy way to enable both the outer energy-convergence test and the
+inner CG energy-decrease coupling without hand-computing the problem size; pass
+at most one of `absdelta` / `delta`.
+"""
+struct NewtonCG{T, A, D, C} <: AbstractOptimizer
+    maxiter::Int
+    miniter::Int
+    xtol::T
+    absdelta::A
+    delta::D
+    cg::C
+end
+
+function NewtonCG(;
+        maxiter = 20,
+        miniter = 0,
+        xtol = 1.0e-5,
+        absdelta = nothing,
+        delta = nothing,
+        cg_rtol = nothing,
+        cg_atol = nothing,
+        cg_maxiter = nothing,
+        cg_miniter = 0,
+    )
+    maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
+    miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
+    absdelta === nothing || delta === nothing ||
+        throw(ArgumentError("pass at most one of `absdelta` / `delta`"))
+    cg = ConjugateGradient(
+        rtol = cg_rtol, atol = cg_atol, maxiter = cg_maxiter, miniter = cg_miniter
+    )
+    return NewtonCG(Int(maxiter), Int(miniter), xtol, absdelta, delta, cg)
+end
+
+"""
+    _optimizer_kwargs(optimizer)
+
+Bridge an optimizer's config to the keyword form the `_optimize` kernels
+consume, so high-level callers thread its settings without a separate options
+bag. For a bare `Optimisers.jl` rule this is a single gradient step per outer
+position update — the user owns the iteration count via the VI loop.
+"""
+_optimizer_kwargs(o::NewtonCG) = (;
+    maxiter = o.maxiter,
+    miniter = o.miniter,
+    xtol = o.xtol,
+    absdelta = o.absdelta,
+    delta = o.delta,
+    cg_rtol = o.cg.rtol,
+    cg_atol = o.cg.atol,
+    cg_maxiter = o.cg.maxiter,
+    cg_miniter = o.cg.miniter,
+)
+_optimizer_kwargs(::Optimisers.AbstractRule) = (; maxiter = 1)
+
+struct OptimizationResult{OPT, S, X, C, K, ST, V, G, I, OE, HE, LS}
     optimizer::OPT
     optimizer_state::S
     x::X
@@ -33,19 +116,25 @@ struct OptimizationResult{OPT,S,X,C,K,ST,V,G,I,OE,HE,LS}
 end
 
 function _optimization_result(
-    optimizer;
-    x,
-    converged::Bool,
-    status,
-    value,
-    gradient,
-    iterations::Integer,
-    objective_evaluations::Integer,
-    hessian_evaluations::Integer=0,
-    line_search_steps::Integer=0,
-    optimizer_state=nothing,
-    skipped::Bool=false,
-)
+        optimizer;
+        x,
+        converged,
+        status,
+        value,
+        gradient,
+        iterations,
+        objective_evaluations,
+        hessian_evaluations = 0,
+        line_search_steps = 0,
+        optimizer_state = nothing,
+        skipped = false,
+    )
+    # No type-coercion / eager `Int(...)` casts: inside a Reactant trace,
+    # the counters arrive as `TracedRNumber{Int}` and the `converged`
+    # flag as `TracedRNumber{Bool}` (see the `_optimize` /
+    # `_run_optimizer_rule` loops that promote via `_maybe_traced` /
+    # `promote_to_traced`). The `OptimizationResult` struct is generic
+    # so storing either host or traced numbers is fine.
     return OptimizationResult(
         optimizer,
         optimizer_state,
@@ -55,10 +144,10 @@ function _optimization_result(
         status,
         value,
         gradient,
-        Int(iterations),
-        Int(objective_evaluations),
-        Int(hessian_evaluations),
-        Int(line_search_steps),
+        iterations,
+        objective_evaluations,
+        hessian_evaluations,
+        line_search_steps,
     )
 end
 
@@ -83,7 +172,7 @@ end
 
 function _check_optimizer_step(new_x, step_size)
     valid = false
-    @trace if all(isfinite, new_x) & isfinite(step_size)
+    @trace if _param_all_finite(new_x) & isfinite(step_size)
         valid = true
     end
     return valid
@@ -98,41 +187,40 @@ function _check_objective_value(new_value)
 end
 
 function _evaluate_optimizer_candidate(
-    step_valid,
-    value,
-    grad,
-    new_x,
-    objective_evaluations,
-    fun_and_grad,
-)
-    new_value = value
-    new_grad = grad
-    value_valid = false
-    evaluations = objective_evaluations
-    @trace if step_valid
-        new_value, new_grad = fun_and_grad(new_x)
-        evaluations += 1
-        value_valid = _check_objective_value(new_value)
-    end
+        step_valid,
+        value,
+        grad,
+        new_x,
+        objective_evaluations,
+        fun_and_grad,
+    )
+    # Evaluate the candidate UNCONDITIONALLY. Guarding `fun_and_grad` (an Enzyme
+    # autodiff) behind `@trace if step_valid` makes XLA compilation of the enclosing
+    # `@trace while` fail with `operand #N does not dominate this use` (a Reactant
+    # bug). A non-finite candidate from a bad step just yields `value_valid = false`
+    # and is discarded downstream.
+    new_value, new_grad = fun_and_grad(new_x)
+    evaluations = objective_evaluations + 1
+    value_valid = step_valid & _check_objective_value(new_value)
     return new_value, new_grad, value_valid, evaluations
 end
 
 function _advance_optimizer_state(
-    step_valid,
-    value_valid,
-    x,
-    value,
-    grad,
-    new_x,
-    new_value,
-    new_grad,
-    iteration,
-    miniter,
-    step_size,
-    xtol,
-    absdelta,
-    status,
-)
+        step_valid,
+        value_valid,
+        x,
+        value,
+        grad,
+        new_x,
+        new_value,
+        new_grad,
+        iteration,
+        miniter,
+        step_size,
+        xtol,
+        absdelta,
+        status,
+    )
     x_out = x
     value_out = value
     grad_out = grad
@@ -167,53 +255,67 @@ _runtime_failure_enabled(x) = true
 _optimizer_state(::Any, x0, previous_result) = nothing
 
 function _optimizer_state(
-    optimizer::Optimisers.AbstractRule,
-    x0,
-    previous_result,
-)
+        optimizer::Optimisers.AbstractRule,
+        x0,
+        previous_result,
+    )
     if previous_result !== nothing &&
-        previous_result isa OptimizationResult &&
-        previous_result.optimizer == optimizer &&
-        previous_result.optimizer_state !== nothing
+            previous_result isa OptimizationResult &&
+            previous_result.optimizer == optimizer &&
+            previous_result.optimizer_state !== nothing
         return previous_result.optimizer_state
     end
     return Optimisers.setup(optimizer, x0)
 end
 
 function _prepare_optimizer_state(
-    optimizer::Optimisers.AbstractRule,
-    x0,
-    optimizer_state,
-)
+        optimizer::Optimisers.AbstractRule,
+        x0,
+        optimizer_state,
+    )
     return isnothing(optimizer_state) ? Optimisers.setup(optimizer, x0) : optimizer_state
 end
 
 _optimizer_update(state, x, grad) = Optimisers.update(state, x, grad)
 
 function _run_optimizer_rule(
-    optimizer,
-    state,
-    x,
-    value,
-    grad;
-    maxiter::Integer=20,
-    miniter::Integer=0,
-    xtol::Real=1e-5,
-    absdelta=nothing,
-    stepnorm=norm,
-    objective_evaluations::Integer=1,
-    evaluate_candidate,
-    evaluation_state,
-)
+        optimizer,
+        state,
+        x,
+        value,
+        grad;
+        maxiter::Integer = 20,
+        miniter::Integer = 0,
+        xtol::Real = 1.0e-5,
+        absdelta = nothing,
+        stepnorm = norm,
+        objective_evaluations::Integer = 1,
+        evaluate_candidate,
+        evaluation_state,
+    )
     iteration = 0
     keep_going = maxiter > 0
     converged = maxiter == 0
     status = converged ? 0 : maxiter
 
-    @trace while keep_going & (iteration < maxiter)
+    # Because I do not track numbers below I need to promote numbers to traced versions
+    # before entering the loop, otherwise they will be treated as constants and not updated.
+    # This is because I can't guarantee that all fields of the structs are traceable.
+    if within_compile()
+        iteration = promote_to_traced(iteration)
+        keep_going = promote_to_traced(keep_going)
+        converged = promote_to_traced(converged)
+        status = promote_to_traced(status)
+        objective_evaluations = promote_to_traced(objective_evaluations)
+    end
+
+    @trace track_numbers = false while keep_going & (iteration < maxiter)
         state, new_x = _optimizer_update(state, x, grad)
-        delta = new_x .- x
-        step_size = stepnorm(delta)
+        # Tree-generic so θ may be a bare array (MGVI/geoVI) or a structured
+        # container (mean-field's NamedTuple); reduces to `new_x .- x` / `norm`
+        # for an array.
+        delta = _param_sub(new_x, x)
+        step_size = _param_norm(delta)
         step_valid = _check_optimizer_step(new_x, step_size)
         new_value, new_grad, value_valid, objective_evaluations = evaluate_candidate(
             step_valid,
@@ -243,14 +345,14 @@ function _run_optimizer_rule(
 
     return _optimization_result(
         optimizer;
-        x=x,
-        converged=converged,
-        status=status,
-        value=value,
-        gradient=grad,
-        iterations=iteration,
-        objective_evaluations=objective_evaluations,
-        optimizer_state=state,
+        x = x,
+        converged = converged,
+        status = status,
+        value = value,
+        gradient = grad,
+        iterations = iteration,
+        objective_evaluations = objective_evaluations,
+        optimizer_state = state,
     )
 end
 
@@ -262,9 +364,9 @@ function _select_array(pred, a, b)
 end
 
 function _line_search_step(
-    ls_it, accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc,
-    x, value, grad, fun_and_grad, valid_curve, curvature_direction,
-)
+        ls_it, accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc,
+        x, value, grad, fun_and_grad, valid_curve, curvature_direction,
+    )
     will_act = !accepted
     trial_x = x .- α .* direction
     trial_value, trial_grad = fun_and_grad(trial_x)
@@ -292,7 +394,7 @@ function _line_search_step(
         out_direction, out_oe_inc
 end
 
-function _line_search(direction0, x, value, grad, fun_and_grad, metricp)
+function _line_search(direction0, x, value, grad, fun_and_grad, metric_op)
     α = one(eltype(x))
     accepted = false
     ls_steps = 0
@@ -302,7 +404,9 @@ function _line_search(direction0, x, value, grad, fun_and_grad, metricp)
     direction = copy(direction0)
     oe_inc = 0
 
-    Mg = metricp(x, grad)
+    # `metric_op` is the operator already pinned at `x` by the caller (built once
+    # per Newton iteration), so this costs one application, not a fresh setup.
+    Mg = metric_op(grad)
     curvature = real(dot(grad, Mg))
     grad_norm_sq = real(dot(grad, grad))
     valid_curve = curvature > 0
@@ -310,36 +414,72 @@ function _line_search(direction0, x, value, grad, fun_and_grad, metricp)
     curvature_direction = (grad_norm_sq / safe_curvature) .* grad
     he_inc = 1
 
+    ls_it = 0
+
     if within_compile()
         α = promote_to_traced(α)
         accepted = promote_to_traced(accepted)
         ls_steps = promote_to_traced(ls_steps)
         oe_inc = promote_to_traced(oe_inc)
+        ls_it = promote_to_traced(ls_it)
     end
 
-    @trace for ls_it in 0:8
+    @trace track_numbers = false while !accepted & (ls_it <= 8)
         (accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc) =
             _line_search_step(
-                ls_it, accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc,
-                x, value, grad, fun_and_grad, valid_curve, curvature_direction,
-            )
+            ls_it, accepted, α, ls_steps, new_x, new_value, new_grad, direction, oe_inc,
+            x, value, grad, fun_and_grad, valid_curve, curvature_direction,
+        )
+        ls_it += 1
     end
 
     return new_x, new_value, new_grad, accepted, α, direction, ls_steps, he_inc, oe_inc
 end
 
 function _newton_cg_iter(
-    active, x, value, grad, status, iterations, converged,
-    objective_evaluations, hessian_evaluations, line_search_steps,
-    cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
-)
-    step, cg_info = solve(cg, v -> metricp(x, v), grad)
-    cg_ok = cg_info.converged
+        active, x, value, grad, status, iterations, converged,
+        objective_evaluations, hessian_evaluations, line_search_steps,
+        cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, prev_value, iteration,
+    )
+    # Eisenstat–Walker forcing sequence (inexact Newton): solve the Newton
+    # system only as tightly as the current gradient warrants. Far from the
+    # optimum (large ‖g‖) CG stops early; near it (small ‖g‖) CG tightens.
+    # Target residual norm = min(0.5, √‖g‖) · ‖g‖  (cf. NIFTy.re / SciPy).
+    # Explicit `cg_rtol`/`cg_atol` (default `nothing`) act as a FLOOR on the inner
+    # residual target — they cap how tightly CG solves (a guard against
+    # over-solving near the optimum), they do NOT tighten the Eisenstat–Walker
+    # forcing: threshold = max(forcing, max(cg_atol, cg_rtol·‖g‖)). Folding them in
+    # with `min` (tightening every iteration) forced a 0.1%-relative inner solve on
+    # every Newton step — including far from the optimum where forcing alone allows
+    # up to 50% — and was a ~12× per-step regression on the geoVI curve. The
+    # `=== nothing` checks are host-side type checks on the config struct, never traced.
+    gnorm = norm(grad)
+    forcing = min(one(gnorm) / 2, sqrt(gnorm)) * gnorm
+    if cg.rtol !== nothing || cg.atol !== nothing
+        forcing = max(forcing, max(_tol_or_zero(cg.atol), _tol_or_zero(cg.rtol) * gnorm))
+    end
+    # NIFTy.re energy-decrease coupling, applied ONLY when the optimizer carries
+    # an `absdelta` (calibrated, e.g. via a `delta`-by-size convenience). The
+    # first iteration uses `absdelta/100`; later iterations ask CG to reduce its
+    # quadratic by 10 % of the last outer Newton gain (`prev_value - value`). When
+    # `absdelta === nothing` (the default, e.g. a bare `NewtonCG()` geoVI curve)
+    # this is `nothing`, so CG falls back to the forcing threshold alone.
+    cg_absdelta = absdelta === nothing ? nothing :
+        ifelse(
+            iteration <= 1,
+            absdelta / 100,
+            _CG_ENERGY_REDUCTION * max(zero(value), prev_value - value),
+        )
+    # Pin the metric at the current `x` ONCE per Newton iteration; the inner CG
+    # applies it every matvec and the line search once more for curvature.
+    metric_op = metricp(x)
+    step, cg_info = solve(cg, metric_op, grad; threshold = forcing, absdelta = cg_absdelta)
+    cg_ok = !cg_info.breakdown
     cg_iters = cg_info.iterations
 
     new_x_ls, new_value_ls, new_grad_ls, accepted, α, direction_used,
         ls_steps, he_inc, oe_inc =
-        _line_search(step, x, value, grad, fun_and_grad, metricp)
+        _line_search(step, x, value, grad, fun_and_grad, metric_op)
 
     energy_diff = value - new_value_ls
     step_size = α * stepnorm(direction_used)
@@ -382,28 +522,36 @@ function _newton_cg_iter(
     new_he = hessian_evaluations + active_int * (cg_iters + cg_ok_int * he_inc)
     new_lss = line_search_steps + cg_ok_int * ls_steps
 
+    # The entry `value` becomes the next iteration's `prev_value`, keying the
+    # next `cg_absdelta` off this step's actual energy decrease.
     return new_active, new_x, new_value, new_grad, new_status, new_iterations, new_converged,
-        new_oe, new_he, new_lss
+        new_oe, new_he, new_lss, value
 end
 
 function _optimize(
-    optimizer::NewtonCG,
-    x0::AbstractArray;
-    fun_and_grad,
-    metricp,
-    maxiter::Integer=20,
-    miniter::Integer=0,
-    xtol::Real=1e-5,
-    absdelta=nothing,
-    cg_rtol::Real=1e-8,
-    cg_atol::Real=0.0,
-    cg_maxiter::Union{Nothing,Integer}=nothing,
-    cg_miniter::Integer=0,
-    stepnorm=norm,
-    optimizer_state=nothing,
-)
+        optimizer::NewtonCG,
+        x0::AbstractArray;
+        fun_and_grad,
+        metricp,
+        maxiter::Integer = 20,
+        miniter::Integer = 0,
+        xtol::Real = 1.0e-5,
+        absdelta = nothing,
+        delta = nothing,
+        cg_rtol::Union{Nothing, Real} = nothing,
+        cg_atol::Union{Nothing, Real} = nothing,
+        cg_maxiter::Union{Nothing, Integer} = nothing,
+        cg_miniter::Integer = 0,
+        stepnorm = norm,
+        optimizer_state = nothing,
+    )
     maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
+    # `delta` is the per-d.o.f. energy-decrease tolerance; the energy is a sum
+    # over the latent dimensions, so the absolute threshold scales with size.
+    # `length(x0)` is static (a plain `Int`, even under Reactant tracing), so the
+    # resulting `absdelta` is a compile-time-known number.
+    absdelta = absdelta === nothing && delta !== nothing ? delta * length(x0) : absdelta
 
     x = x0
     value, grad = fun_and_grad(x)
@@ -413,64 +561,88 @@ function _optimize(
     if maxiter == 0
         return _optimization_result(
             optimizer;
-            x=x,
-            converged=true,
-            status=0,
-            value=value,
-            gradient=grad,
-            iterations=0,
-            objective_evaluations=objective_evaluations,
-            hessian_evaluations=hessian_evaluations,
-            line_search_steps=line_search_steps,
+            x = x,
+            converged = true,
+            status = 0,
+            value = value,
+            gradient = grad,
+            iterations = 0,
+            objective_evaluations = objective_evaluations,
+            hessian_evaluations = hessian_evaluations,
+            line_search_steps = line_search_steps,
         )
     end
 
-    cg = ConjugateGradient(rtol=cg_rtol, atol=cg_atol, maxiter=cg_maxiter, miniter=cg_miniter)
+    cg = ConjugateGradient(rtol = cg_rtol, atol = cg_atol, maxiter = cg_maxiter, miniter = cg_miniter)
     converged = false
     status = maxiter
     iterations = 0
     active = true
+    iteration = 0
+    # `prev_value` is loop-carried (it lags `value` by one iteration to feed the
+    # CG energy-coupling). It must be a TracedRNumber under compile AND a node
+    # distinct from `value` — `value + zero(value)` gives a fresh traced node
+    # (plain `prev_value = value` would alias `value`'s node and break Reactant's
+    # `@trace while` carry/result matching).
+    prev_value = value + zero(value)
 
-    @trace for iteration in 1:maxiter
-        (active, x, value, grad, status, iterations, converged,
-         objective_evaluations, hessian_evaluations, line_search_steps) =
+    if within_compile()
+        active = promote_to_traced(active)
+        converged = promote_to_traced(converged)
+        status = promote_to_traced(status)
+        iterations = promote_to_traced(iterations)
+        iteration = promote_to_traced(iteration)
+        objective_evaluations = promote_to_traced(objective_evaluations)
+        hessian_evaluations = promote_to_traced(hessian_evaluations)
+        line_search_steps = promote_to_traced(line_search_steps)
+    end
+
+    @trace track_numbers = false while active & (iteration < maxiter)
+        iteration += 1
+        (
+            active, x, value, grad, status, iterations, converged,
+            objective_evaluations, hessian_evaluations, line_search_steps, prev_value,
+        ) =
             _newton_cg_iter(
-                active, x, value, grad, status, iterations, converged,
-                objective_evaluations, hessian_evaluations, line_search_steps,
-                cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, iteration,
-            )
+            active, x, value, grad, status, iterations, converged,
+            objective_evaluations, hessian_evaluations, line_search_steps,
+            cg, metricp, fun_and_grad, stepnorm, miniter, xtol, absdelta, prev_value, iteration,
+        )
     end
 
     return _optimization_result(
         optimizer;
-        x=x,
-        converged=converged,
-        status=status,
-        value=value,
-        gradient=grad,
-        iterations=iterations,
-        objective_evaluations=objective_evaluations,
-        hessian_evaluations=hessian_evaluations,
-        line_search_steps=line_search_steps,
+        x = x,
+        converged = converged,
+        status = status,
+        value = value,
+        gradient = grad,
+        iterations = iterations,
+        objective_evaluations = objective_evaluations,
+        hessian_evaluations = hessian_evaluations,
+        line_search_steps = line_search_steps,
     )
 end
 
 function _optimize(
-    optimizer::Optimisers.AbstractRule,
-    x0::AbstractArray;
-    fun_and_grad,
-    metricp=nothing,
-    maxiter::Integer=20,
-    miniter::Integer=0,
-    xtol::Real=1e-5,
-    absdelta=nothing,
-    cg_rtol::Real=1e-8,
-    cg_atol::Real=0.0,
-    cg_maxiter::Union{Nothing,Integer}=nothing,
-    cg_miniter::Integer=0,
-    stepnorm=norm,
-    optimizer_state=nothing,
-)
+        optimizer::Optimisers.AbstractRule,
+        x0;
+        fun_and_grad,
+        metricp = nothing,
+        maxiter::Integer = 20,
+        miniter::Integer = 0,
+        xtol::Real = 1.0e-5,
+        absdelta = nothing,
+        delta = nothing,
+        cg_rtol::Union{Nothing, Real} = nothing,
+        cg_atol::Union{Nothing, Real} = nothing,
+        cg_maxiter::Union{Nothing, Integer} = nothing,
+        cg_miniter::Integer = 0,
+        stepnorm = norm,
+        optimizer_state = nothing,
+    )
+    # `delta`/CG keywords are accepted for a uniform call signature but unused by
+    # a first-order rule (no inner CG, no energy-decrease criterion).
     maxiter >= 0 || throw(ArgumentError("`maxiter` must be non-negative"))
     miniter >= 0 || throw(ArgumentError("`miniter` must be non-negative"))
 
@@ -483,13 +655,13 @@ function _optimize(
         x,
         value,
         grad;
-        maxiter=maxiter,
-        miniter=miniter,
-        xtol=xtol,
-        absdelta=absdelta,
-        stepnorm=stepnorm,
-        objective_evaluations=1,
-        evaluate_candidate=_evaluate_optimizer_candidate,
-        evaluation_state=fun_and_grad,
+        maxiter = maxiter,
+        miniter = miniter,
+        xtol = xtol,
+        absdelta = absdelta,
+        stepnorm = stepnorm,
+        objective_evaluations = 1,
+        evaluate_candidate = _evaluate_optimizer_candidate,
+        evaluation_state = fun_and_grad,
     )
 end

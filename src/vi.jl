@@ -1,330 +1,365 @@
 """
-    AbstractVariationalFamily
-
-Marker supertype for variational-sampling schemes.
-"""
-abstract type AbstractVariationalFamily end
-struct MGVIFamily <: AbstractVariationalFamily end
-struct GeoVIFamily <: AbstractVariationalFamily end
-
-"""
     AbstractFDivergence
 
 Marker supertype for f-divergence objectives optimized by the outer VI loop.
 
-To add a new divergence, subtype `AbstractFDivergence` and implement the
-internal objective hooks `_fdivergence_value(::YourDivergence, ...)` and
-`_fdivergence_fishermetric(::YourDivergence, ...)`.
+The objective hook `_fdivergence_value(family, divergence, ...)` dispatches jointly on
+the family and the divergence, so a new scheme may ship its own objective form.
 """
 abstract type AbstractFDivergence end
 struct ReverseKL <: AbstractFDivergence end
 struct ForwardKL <: AbstractFDivergence end
 
-struct VIConfig{AD,DL,NU,OO}
-    adtype::AD
-    n_iterations::Int
-    n_samples::Int
-    mirrored::Bool
-    draw_linear::DL
-    nonlinear_update::NU
-    optimizer_options::OO
+# The problem input is a *position* only. `step_vi!` redraws the residuals at the start
+# of every step, so initial residuals could never influence a fit — accepting them would
+# only invite `update!`-before-`draw_samples!` misuse.
+function _problem_samples(samples::Samples)
+    samples.residuals === nothing || throw(
+        ArgumentError(
+            "the initial `Samples` must not carry residuals — `step_vi!` redraws them " *
+                "at the start of every step, so they would never be used; pass the " *
+                "position alone",
+        ),
+    )
+    return samples
 end
+_problem_samples(position::AbstractArray) = Samples(position, nothing; keys = nothing)
 
-struct VariationalProblem{L,S,F,D,O,C,AD,DL,NU,OO}
+"""
+    VariationalProblem(lh, position_or_samples; family, divergence, estimator, optimizer, adtype)
+
+Bundle a likelihood with the four orthogonal VI axes (`family`, `divergence`,
+`estimator`, `optimizer`) plus the AD backend. `position_or_samples` is the
+initial latent point `ξ₀` (a flat white array) or a [`Samples`](@ref) whose
+`position` is `ξ₀` (and whose residuals must be `nothing` — [`step_vi!`](@ref)
+redraws the sample set at the start of every step, so initial residuals could
+never be used).
+
+Every construction path validates the axis combination (`NewtonCG` requires a
+natural-gradient family; structured-θ families require `n_samples > 0`; only
+`ReverseKL` is implemented).
+
+!!! note "AD backend cost"
+    The default `adtype = AutoFiniteDiff()` needs no extra packages but costs
+    `2·length(ξ₀)` objective evaluations per gradient — each an `n_samples`
+    Monte-Carlo sum over the forward model. For anything beyond toy problems
+    load Enzyme and pass `adtype = AutoEnzyme()` (inferred as `AutoReactant`
+    automatically for Reactant arrays).
+"""
+struct VariationalProblem{L, S, F, D, E, O, AD}
     likelihood::L
     initial_samples::S
     family::F
     divergence::D
+    estimator::E
     optimizer::O
-    config::C
     adtype::AD
-    draw_linear_options::DL
-    nonlinear_update_options::NU
-    optimizer_options::OO
-    n_base_draws::Int
+
+    function VariationalProblem(lh, position_or_samples, family, divergence, estimator, optimizer, adtype)
+        samples = _problem_samples(position_or_samples)
+        # Validation is host-only: under a Reactant trace the problem may be
+        # reconstructed with traced fields, where re-validating is wasted work.
+        within_compile() ||
+            _require_supported(family, divergence, estimator, optimizer, samples.position)
+        return new{
+            typeof(lh), typeof(samples), typeof(family), typeof(divergence),
+            typeof(estimator), typeof(optimizer), typeof(adtype),
+        }(lh, samples, family, divergence, estimator, optimizer, adtype)
+    end
 end
 
-struct VIState{R,S,M}
-    iteration::Int
-    rng::R
-    sample_state::S
-    minimization_state::M
-    cache::Any
-end
+_infer_adtype(adtype, x) = adtype
 
-function VIConfig(;
-    adtype=ADTypes.AutoFiniteDiff(),
-    n_iterations::Integer=0,
-    n_samples::Integer=0,
-    mirrored::Bool=true,
-    draw_linear=(;),
-    nonlinear_update=(;),
-    optimizer_options=(;),
-)
-    adtype === nothing && (adtype = ADTypes.AutoFiniteDiff())
-    n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))
-    n_samples >= 0 || throw(ArgumentError("`n_samples` must be non-negative"))
-    mirrored && isodd(n_samples) &&
-        throw(ArgumentError("mirrored sampling requires an even `n_samples`"))
-    return VIConfig(
-        adtype,
-        Int(n_iterations),
-        Int(n_samples),
-        mirrored,
-        draw_linear,
-        nonlinear_update,
-        optimizer_options,
-    )
-end
-
-function VIState(;
-    iteration::Integer=0,
-    rng=nothing,
-    sample_state=nothing,
-    minimization_state=nothing,
-    cache=nothing,
-)
-    return VIState(Int(iteration), rng, sample_state, minimization_state, cache)
-end
-
-function _resolve_draw_linear_options(options)
-    return (
-        cg_rtol=_option(options, :cg_rtol, 1e-8),
-        cg_atol=_option(options, :cg_atol, 0.0),
-        cg_maxiter=_option(options, :cg_maxiter, nothing),
-        cg_miniter=_option(options, :cg_miniter, 0),
-        throw_on_failure=_option(options, :throw_on_failure, true),
-    )
-end
-
-function _resolve_nonlinear_update_options(options)
-    return (
-        maxiter=_option(options, :maxiter, 20),
-        miniter=_option(options, :miniter, 0),
-        xtol=_option(options, :xtol, 1e-5),
-        absdelta=_option(options, :absdelta, nothing),
-        cg_rtol=_option(options, :cg_rtol, 1e-8),
-        cg_atol=_option(options, :cg_atol, 0.0),
-        cg_maxiter=_option(options, :cg_maxiter, nothing),
-        cg_miniter=_option(options, :cg_miniter, 0),
-        throw_on_failure=_option(options, :throw_on_failure, true),
-    )
-end
-
-function _resolve_optimizer_options(options)
-    return (
-        maxiter=_option(options, :maxiter, 20),
-        miniter=_option(options, :miniter, 0),
-        xtol=_option(options, :xtol, 1e-5),
-        absdelta=_option(options, :absdelta, nothing),
-        cg_rtol=_option(options, :cg_rtol, 1e-8),
-        cg_atol=_option(options, :cg_atol, 0.0),
-        cg_maxiter=_option(options, :cg_maxiter, nothing),
-        cg_miniter=_option(options, :cg_miniter, 0),
-        fd_eps=_option(options, :fd_eps, 1e-6),
-    )
-end
-
-_n_base_draws(config::VIConfig) = config.mirrored ? (config.n_samples ÷ 2) : config.n_samples
-
-_problem_samples(samples::Samples) = samples
-_problem_samples(position::AbstractArray) = Samples(position, nothing; keys=nothing)
-
-function _problem_adtype(config::VIConfig, samples::Samples)
-    samples.position === nothing && return config.adtype
-    return _infer_adtype(config.adtype, samples.position)
+function _problem_adtype(adtype, samples::Samples)
+    samples.position === nothing && return adtype
+    return _infer_adtype(adtype, samples.position)
 end
 
 function VariationalProblem(
-    lh::AbstractLikelihood,
-    position_or_samples;
-    family::AbstractVariationalFamily=GeoVIFamily(),
-    divergence::AbstractFDivergence=ReverseKL(),
-    optimizer=NewtonCG(),
-    config::VIConfig=VIConfig(),
-)
+        lh::AbstractLikelihood,
+        position_or_samples;
+        family::AbstractVariationalFamily = GeoVIFamily(),
+        divergence::AbstractFDivergence = ReverseKL(),
+        estimator::AbstractEstimator = MCEstimator(),
+        optimizer = NewtonCG(),
+        adtype = ADTypes.AutoFiniteDiff(),
+    )
+    adtype === nothing && (adtype = ADTypes.AutoFiniteDiff())
     samples = _problem_samples(position_or_samples)
-    _require_supported(divergence, optimizer)
     return VariationalProblem(
         lh,
         samples,
         family,
         divergence,
+        estimator,
         optimizer,
-        config,
-        _problem_adtype(config, samples),
-        _resolve_draw_linear_options(config.draw_linear),
-        _resolve_nonlinear_update_options(config.nonlinear_update),
-        _resolve_optimizer_options(config.optimizer_options),
-        _n_base_draws(config),
+        _problem_adtype(adtype, samples),
     )
+end
+
+_n_base_draws(problem::VariationalProblem) = _n_base_draws(problem.estimator)
+
+# ── VI loop state ──────────────────────────────────────────────────────────
+
+"""
+    VIState
+
+Mutable numeric state for the VI loop: only the evolving quantities, not the
+problem or the RNG (both are passed to [`step_vi!`](@ref) separately). Allocated
+once by [`init`](@ref) with every field at its final type — the current parameters
+(`position`), the residual buffer (`residuals`) that [`draw_samples!`](@ref GeoVI.draw_samples!)
+fills, and the threaded `optimizer_state` — advanced in place, so reusing one `VIState`
+keeps per-iteration allocation flat. It holds no host-only fields (no iteration counter,
+no compile cache), so [`step_vi!`](@ref) is a pure in-place mutation the user can
+`@compile` directly under Reactant.
+
+`residuals` is shaped `(n_samples, latent…)`, or `nothing` when there are no samples (MAP).
+The white noise the draw consumes is transient scratch allocated inside `draw_samples!`,
+not stored here.
+"""
+mutable struct VIState{P, R, Os}
+    position::P
+    residuals::R
+    optimizer_state::Os
 end
 
 _wrap_rng(_adtype, rng) = rng
 
-initialize_vi(rng; config::VIConfig) = VIState(iteration=0, rng=rng)
-initialize_vi(problem::VariationalProblem, rng::AbstractRNG=Random.default_rng()) =
-    VIState(iteration=0, rng=_wrap_rng(problem.adtype, rng))
+# Zero-filled, never uninitialized: there is no "residuals not yet drawn" state after
+# `init`. (Zero residuals are the degenerate sample set collapsed onto the mean, so even a
+# custom loop calling `GeoVI.update!` before the first `GeoVI.draw_samples!` is
+# well-defined, not reading garbage.)
+function _init_residual_buffer(problem::VariationalProblem, latent)
+    n_stored = _n_stored_samples(problem.estimator)
+    n_stored == 0 && return nothing
+    residuals = similar(latent, (n_stored, size(latent)...))
+    return fill!(residuals, zero(eltype(residuals)))
+end
+
+# Fresh optimizer state for the chosen optimizer (`nothing` for the stateless
+# `NewtonCG`, an `Optimisers` setup for a rule). Threaded across steps.
+_init_optimizer_state(problem::VariationalProblem, position) =
+    _optimizer_state(problem.optimizer, position, nothing)
+
+"""
+    init([rng], problem[, ξ0]) -> (rng, state)
+
+Allocate the [`VIState`](@ref) for `problem` — a fresh copy of the initial
+position, the residual buffer, and the optimizer state — and return it together
+with the loop RNG to thread through [`step_vi!`](@ref).
+
+`ξ0` optionally overrides the problem's initial latent point
+(`problem.initial_samples.position`); it is the **starting latent point** (for
+MGVI/geoVI the mean the optimizer starts from, for mean-field the seed for
+`(; mean = ξ0, logstd = 0)`). This is how you restart from a new point without
+rebuilding the `problem`. To restart an *existing* state in place (reusing its
+buffers), use [`reset!`](@ref) instead.
+
+`rng` is first-positional or auto-generated (`Random.default_rng()`); it is never
+a keyword. For an `AutoReactant` problem the RNG is wrapped into a
+`Reactant.ReactantRNG` (the compiled step is built lazily by `fit`, or by the
+user calling `@compile step_vi!(...)`).
+
+The residual buffer starts zero-filled; [`step_vi!`](@ref) redraws it at the
+start of every step.
+"""
+function init(rng::AbstractRNG, problem::VariationalProblem, ξ0 = nothing)
+    # All buffers are sized from the latent point ξ₀ (latent-shaped by
+    # construction), so the interface needs no `θ → latent` projection.
+    latent = something(ξ0, problem.initial_samples.position)
+    θ = init_params(problem.family, latent)
+    residuals = _init_residual_buffer(problem, latent)
+    optimizer_state = _init_optimizer_state(problem, θ)
+    wrapped_rng = _wrap_rng(problem.adtype, rng)
+    return wrapped_rng, VIState(θ, residuals, optimizer_state)
+end
+
+init(problem::VariationalProblem) = init(Random.default_rng(), problem)
+init(problem::VariationalProblem, ξ0) = init(Random.default_rng(), problem, ξ0)
+
+# Latent-sized reference array inside a θ container, for reset!'s size check.
+# Array families: θ *is* the latent. Mean-field: θ.mean is latent-sized.
+_latent_ref(θ::AbstractArray) = θ
+_latent_ref(θ) = first(values(θ))
+
+"""
+    reset!(state, problem, ξ0) -> state
+
+Re-initialize an existing [`VIState`](@ref) in place to restart from a new
+starting latent point `ξ0`, reusing `state`'s buffers instead of allocating.
+This is [`init`](@ref) for an already-allocated state: the variational parameters
+are rebuilt from `ξ0` via `init_params`, the residual buffer is zeroed (it is
+redrawn at the start of every [`step_vi!`](@ref) anyway), and the optimizer state
+is reset to fresh (momentum cleared).
+
+`state.position` and `state.residuals` keep their array identity (so a compiled
+`step_vi!` thunk stays valid under Reactant); the optimizer state is reassigned,
+matching [`update!`](@ref)'s per-step behavior. `ξ0` must match the existing
+latent size — `reset!` cannot resize; call [`init`](@ref) for a different size.
+"""
+function reset!(state::VIState, problem::VariationalProblem, ξ0::AbstractArray)
+    ref = _latent_ref(state.position)
+    size(ref) == size(ξ0) || throw(
+        DimensionMismatch(
+            "reset! cannot resize: state latent size $(size(ref)), new ξ0 size " *
+                "$(size(ξ0)). Use `init` to allocate a fresh state of the new size."
+        ),
+    )
+    θ_new = init_params(problem.family, ξ0)
+    # Leaf-wise in-place copy preserves position-buffer identity (cf. `update!`);
+    # for a bare-array θ this is exactly `copyto!(state.position, θ_new)`.
+    fmap(copyto!, state.position, θ_new)
+    state.residuals === nothing ||
+        fill!(state.residuals, zero(eltype(state.residuals)))
+    # Reassign (do NOT fmap-copy): optimizer trees have non-array leaves.
+    state.optimizer_state = _init_optimizer_state(problem, state.position)
+    return state
+end
+
+# ── Sample-block plumbing (Reactant-safe) ──────────────────────────────────
 
 function _single_sample_block(residual::AbstractArray)
     return reshape(residual, (1, size(residual)...))
 end
 
-_sample_block_size(block::AbstractArray) = size(block, 1)
-
-function _allocate_sample_residuals(block::AbstractArray, n_blocks::Integer)
-    trailing_dims = ntuple(i -> size(block, i + 1), max(ndims(block) - 1, 0))
-    return similar(block, (n_blocks * _sample_block_size(block), trailing_dims...))
-end
-
-function _write_sample_block!(dest::AbstractArray, i::Integer, block::AbstractArray)
-    block_size = _sample_block_size(block)
-    first = (Int(i) - 1) * block_size + 1
-    last = first + block_size - 1
+function _write_sample_block!(dest::AbstractArray, i, block::AbstractArray)
+    block_size = size(block, 1)
+    offset = (i - 1) * block_size
     trailing = ntuple(_ -> Colon(), max(ndims(block) - 1, 0))
-    dest[first:last, trailing...] = block
+    for j in 1:block_size
+        dest[offset + j, trailing...] = block[j, trailing...]
+    end
     return dest
 end
 
-_strip_cache(state::VIState) = VIState(
-    iteration=state.iteration,
-    rng=state.rng,
-    sample_state=state.sample_state,
-    minimization_state=state.minimization_state,
+_draw_linear_kwargs(solver::ConjugateGradient) = (;
+    cg_rtol = solver.rtol,
+    cg_atol = solver.atol,
+    cg_maxiter = solver.maxiter,
+    cg_miniter = solver.miniter,
 )
 
-function _restore_cache(state::VIState, cache)
-    return VIState(
-        iteration=state.iteration,
-        rng=state.rng,
-        sample_state=state.sample_state,
-        minimization_state=state.minimization_state,
-        cache=cache,
-    )
-end
 
-function _draw_sample_block(
-    problem::VariationalProblem,
-    ::MGVIFamily,
-    position::AbstractArray,
-    rng::AbstractRNG,
-)
-    linear_draw = draw_linear_residual(
-        problem.likelihood,
-        position,
-        rng;
-        problem.draw_linear_options...,
-    )
-    block = problem.config.mirrored ?
-        _stack_residuals(linear_draw.residual, -linear_draw.residual) :
-        _single_sample_block(linear_draw.residual)
-    return block, linear_draw
-end
+"""
+    draw_residuals(problem, position, rng)
+    draw_residuals(family, estimator, lh, position, rng)
 
-function _draw_sample_block(
-    problem::VariationalProblem,
-    ::GeoVIFamily,
-    position::AbstractArray,
-    rng::AbstractRNG,
-)
-    linear_draw = draw_linear_residual(
-        problem.likelihood,
-        position,
-        rng;
-        problem.draw_linear_options...,
-    )
+Draw the Monte-Carlo residual set used to estimate `E_q[·]` at the latent point
+`position`: `estimator` controls the count/mirroring, `family` controls how each draw is
+realized (via `GeoVI.draw_samples!`).
+"""
+draw_residuals(problem::VariationalProblem, position::AbstractArray, rng::AbstractRNG) =
+    draw_residuals(problem.family, problem.estimator, problem.likelihood, position, rng)
 
-    if problem.config.mirrored
-        positive_update = update_nonlinear_residual(
-            problem.likelihood,
-            position,
-            linear_draw;
-            optimizer=problem.optimizer,
-            optimizer_options=problem.nonlinear_update_options,
-            throw_on_failure=problem.nonlinear_update_options.throw_on_failure,
-        )
-        negative_update = update_nonlinear_residual(
-            problem.likelihood,
-            position,
-            -linear_draw.residual;
-            metric_sample=linear_draw.metric_sample,
-            metric_sample_sign=-1,
-            optimizer=problem.optimizer,
-            optimizer_options=problem.nonlinear_update_options,
-            throw_on_failure=problem.nonlinear_update_options.throw_on_failure,
-        )
-        draw = MirroredResidualDraw(
-            _stack_residuals(positive_update.residual, negative_update.residual),
-            linear_draw,
-            positive_update,
-            negative_update,
-        )
-        return draw.residuals, draw
+function draw_residuals(
+        family::AbstractVariationalFamily,
+        estimator::AbstractEstimator,
+        lh::AbstractLikelihood,
+        position::AbstractArray,
+        rng::AbstractRNG,
+    )
+    n = _n_base_draws(estimator)
+    mirrored = _mirrored(estimator)
+    if n == 0
+        return Samples(position, nothing; keys = nothing),
+            (family = family, mirrored = mirrored, n_draws = 0)
     end
 
-    curved_update = update_nonlinear_residual(
-        problem.likelihood,
-        position,
-        linear_draw;
-        optimizer=problem.optimizer,
-        optimizer_options=problem.nonlinear_update_options,
-        throw_on_failure=problem.nonlinear_update_options.throw_on_failure,
+    n_stored = _n_stored_samples(estimator)
+    residuals = similar(position, (n_stored, size(position)...))
+    draw_samples!(family, lh, position, residuals, rng, mirrored)
+
+    # `keys` indexes the STORED rows (mirrored pairs count as two), matching
+    # `length(samples)`.
+    return Samples(position, residuals; keys = Base.OneTo(n_stored)),
+        (family = family, mirrored = mirrored, n_draws = n)
+end
+
+# ── The two VI phases (composable primitives; unexported) ───────────────────
+#
+# A VI iteration is `draw_samples! → update!`:
+#   draw_samples! — fill the residual buffer with a Monte-Carlo set drawn at the current
+#                   mean (pushforward: IID white noise; MGVI: CG solve `(I+Fisher)δ = η`;
+#                   geoVI: + the nonlinear curve). The only stochastic phase.
+#   update!       — estimate the KL with that fixed set and move the variational parameters
+#                   (one `Optimisers` step, or `NewtonCG` to convergence).
+# This is the `draw → optimize-against-fixed-samples → resample` loop (NIFTy's
+# `OptimizeVI.update`); a custom loop can call the two phases directly.
+
+"""
+    draw_samples!(rng, problem, state) -> state
+
+VI phase 1: fill `state.residuals` with a fresh Monte-Carlo sample set drawn at the current
+parameters, dispatching to the family's `GeoVI.draw_samples!`. The only stochastic phase.
+No-op for a MAP problem (no samples). Unexported.
+"""
+function draw_samples!(rng::AbstractRNG, problem::VariationalProblem, state::VIState)
+    state.residuals === nothing && return state
+    draw_samples!(
+        problem.family, problem.likelihood, state.position, state.residuals, rng,
+        _mirrored(problem.estimator),
     )
-    return _single_sample_block(curved_update.residual), curved_update
+    return state
 end
 
-function _draw_samples(
-    problem::VariationalProblem,
-    position::AbstractArray,
-    rng::AbstractRNG,
-)
-    if problem.config.n_samples == 0
-        return Samples(position, nothing; keys=nothing),
-        (family=problem.family, mirrored=problem.config.mirrored, n_draws=0)
-    end
+"""
+    update!(problem, state) -> state
 
-    first_block, _ = _draw_sample_block(problem, problem.family, position, rng)
-    residuals = _allocate_sample_residuals(first_block, problem.n_base_draws)
-    _write_sample_block!(residuals, 1, first_block)
-
-    for i in 2:problem.n_base_draws
-        block, _ = _draw_sample_block(problem, problem.family, position, rng)
-        _write_sample_block!(residuals, i, block)
-    end
-
-    return Samples(position, residuals; keys=Base.OneTo(problem.n_base_draws)),
-    (family=problem.family, mirrored=problem.config.mirrored, n_draws=problem.n_base_draws)
+VI phase 2: estimate the KL with the current samples and move the variational
+mean (the position optimization), writing it back into `state.position`.
+Unexported.
+"""
+function update!(problem::VariationalProblem, state::VIState)
+    result = _optimize_position(problem, state.position, state.residuals, state.optimizer_state)
+    # `fmap(copyto!, …)` writes leaf-wise into the existing parameter buffers
+    # (preserving their identity for Reactant in-place aliasing); for a bare-array
+    # θ this is exactly `copyto!(state.position, result.x)`.
+    fmap(copyto!, state.position, result.x)
+    state.optimizer_state = result.optimizer_state
+    return state
 end
+
+# ── Objective: family × divergence ─────────────────────────────────────────
 
 _negative_logposterior(lh::AbstractLikelihood, x::AbstractArray) =
     -logdensity(lh, x) + 0.5 * real(dot(x, x))
 
-function _sample_position(position::AbstractArray, residuals::AbstractArray, i::Int)
-    return _sample_slice(residuals, i) .+ position
-end
-
+# The one reverse-KL objective for every family (Fisher-Gaussian, mean-field, and any
+# pushforward family): `mean_i[-log p(ξ_i) + log q_θ(ξ_i)]`. Fisher-Gaussian families
+# take the `logdensity` default 0 and recover `mean_i[-log p(ξ_i)]`.
 function _fdivergence_value(
-    ::ReverseKL,
-    lh::AbstractLikelihood,
-    position::AbstractArray,
-    residuals,
-)
+        family::AbstractVariationalFamily,
+        ::ReverseKL,
+        lh::AbstractLikelihood,
+        position,
+        residuals,
+    )
+    # MAP (no samples) is only reachable for a bare-array family (θ is the latent point);
+    # structured-θ families require `n_samples > 0`.
     residuals === nothing && return _negative_logposterior(lh, position)
 
-    value = zero(eltype(position))
+    value = zero(eltype(residuals))
     n = _sample_count(residuals)
-    for i in 1:n
-        value += _negative_logposterior(lh, _sample_position(position, residuals, i))
+    # `@trace for` so the n-fold Monte Carlo sum compiles to a single MLIR while-loop
+    # body instead of n trace-time-unrolled iterations. `value` is already a
+    # `TracedRNumber` here (via `zero(eltype(...))`), so no explicit promotion is needed.
+    @trace track_numbers = false for i in 1:n
+        r = _sample_slice(residuals, i)
+        # `transport_and_logjac` returns both the latent sample ξ and the reparameterization's
+        # log-Jacobian; the reverse-KL objective is `mean_i[-log p(ξ_i) - logjac_i]`.
+        ξ, logjac = transport_and_logjac(family, position, r)
+        value = value + _negative_logposterior(lh, ξ) - logjac
     end
     return value / n
 end
 
 function _fdivergence_value(
-    ::ForwardKL,
-    lh::AbstractLikelihood,
-    position::AbstractArray,
-    residuals,
-)
+        ::AbstractVariationalFamily,
+        ::ForwardKL,
+        lh::AbstractLikelihood,
+        position::AbstractArray,
+        residuals,
+    )
     throw(
         ArgumentError(
             "`ForwardKL` is not implemented yet; only `ReverseKL()` is supported in `fit`",
@@ -332,11 +367,13 @@ function _fdivergence_value(
     )
 end
 
+# ── AD plumbing ────────────────────────────────────────────────────────────
+
 function _finite_difference_value_and_gradient(
-    objective,
-    x::AbstractArray;
-    relstep::Real=1e-6,
-)
+        objective,
+        x::AbstractArray;
+        relstep::Real = 1.0e-6,
+    )
     relstep > 0 || throw(ArgumentError("`relstep` must be positive"))
 
     value = objective(x)
@@ -357,27 +394,35 @@ function _finite_difference_value_and_gradient(
     return value, grad
 end
 
+# Tree-structured θ (e.g. mean-field's NamedTuple): flatten with `destructure`,
+# run the array finite-difference on the flat vector, and reconstruct the gradient
+# into the same structure. Arrays dispatch to the `::AbstractArray` method above,
+# so this only fires for non-array parameter containers.
+function _finite_difference_value_and_gradient(objective, x; relstep::Real = 1.0e-6)
+    flat, re = Optimisers.destructure(x)
+    value, gflat = _finite_difference_value_and_gradient(objective ∘ re, flat; relstep = relstep)
+    return value, re(gflat)
+end
+
 function _unsupported_adtype_message(adtype)
     return "AD choice $(typeof(adtype)) is not available. Load the corresponding AD package/extension or choose a supported `ADTypes` backend."
 end
 
-_infer_adtype(adtype, x) = adtype
-
 function _value_and_gradient(
-    ::ADTypes.AutoFiniteDiff,
-    objective,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
-    return _finite_difference_value_and_gradient(objective, x; relstep=fd_eps)
+        ::ADTypes.AutoFiniteDiff,
+        objective,
+        x;
+        fd_eps::Real = 1.0e-6,
+    )
+    return _finite_difference_value_and_gradient(objective, x; relstep = fd_eps)
 end
 
 function _value_and_gradient(
-    ::ADTypes.NoAutoDiff,
-    objective,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
+        ::ADTypes.NoAutoDiff,
+        objective,
+        x;
+        fd_eps::Real = 1.0e-6,
+    )
     throw(
         ArgumentError(
             "`NoAutoDiff()` disables differentiation; choose a concrete AD backend like `AutoFiniteDiff()` or `AutoEnzyme()`",
@@ -386,310 +431,160 @@ function _value_and_gradient(
 end
 
 function _value_and_gradient(
-    adtype::ADTypes.AbstractADType,
-    objective,
-    x::AbstractArray;
-    fd_eps::Real=1e-6,
-)
+        adtype::ADTypes.AbstractADType,
+        objective,
+        x;
+        fd_eps::Real = 1.0e-6,
+    )
     throw(ArgumentError(_unsupported_adtype_message(adtype)))
 end
 
-function _fdivergence_value_and_gradient(
-    adtype,
-    divergence::AbstractFDivergence,
-    lh::AbstractLikelihood,
-    position::AbstractArray,
-    residuals;
-    fd_eps::Real=1e-6,
-)
-    objective = x -> _fdivergence_value(divergence, lh, x, residuals)
-    return _value_and_gradient(adtype, objective, position; fd_eps=fd_eps)
-end
+# ── Outer position update ──────────────────────────────────────────────────
 
-function _fdivergence_fishermetric(
-    ::AbstractFDivergence,
-    lh::AbstractLikelihood,
-    position::AbstractArray,
-    residuals,
-    v::AbstractArray,
-)
-    residuals === nothing && return _posterior_metric(lh, position, v)
-
-    result = zero(v)
-    n = _sample_count(residuals)
-    for i in 1:n
-        result = result .+ _posterior_metric(
-            lh,
-            _sample_position(position, residuals, i),
-            v,
-        ) ./ n
-    end
-    return result
-end
-
-function _require_supported(divergence::AbstractFDivergence, optimizer)
+function _require_supported(
+        family::AbstractVariationalFamily,
+        divergence::AbstractFDivergence,
+        estimator::AbstractEstimator,
+        optimizer,
+        position,
+    )
     divergence isa ReverseKL || throw(
         ArgumentError(
             "`fit` currently supports `ReverseKL()` only; got $(typeof(divergence))",
         ),
     )
-    optimizer isa NewtonCG && return nothing
-    optimizer isa Optimisers.AbstractRule && return nothing
-    throw(
-        ArgumentError(
-            "`fit` expects either `NewtonCG()` or an `Optimisers.jl` rule; got $(typeof(optimizer))",
-        ),
-    )
+    # `NewtonCG` is natural-gradient: it needs the family's metric. Any family may opt in
+    # via `supports_natural_gradient`; the Fisher-Gaussian families do, mean-field (and
+    # other pushforward families) do not — they take a bare `Optimisers.jl` rule.
+    if optimizer isa NewtonCG
+        supports_natural_gradient(family) || throw(
+            ArgumentError(
+                "`$(nameof(typeof(family)))` does not support `NewtonCG` (no natural-gradient " *
+                    "metric); use an `Optimisers.jl` rule (e.g. `Optimisers.Adam`).",
+            ),
+        )
+    elseif !(optimizer isa Optimisers.AbstractRule)
+        throw(
+            ArgumentError(
+                "`fit` expects `NewtonCG()` or an `Optimisers.jl` rule; got $(typeof(optimizer))",
+            ),
+        )
+    end
+    # With no samples the objective degenerates to the negative log-posterior at θ
+    # (MAP), which is only defined when θ is itself the latent point. A structured-θ
+    # family (NamedTuple parameters, e.g. mean-field) therefore needs samples.
+    if _n_stored_samples(estimator) == 0 && position !== nothing
+        θ0 = init_params(family, position)
+        θ0 isa AbstractArray || throw(
+            ArgumentError(
+                "`$(nameof(typeof(family)))` has structured parameters " *
+                    "(θ::$(typeof(θ0)) is not the latent point), so the sample-free MAP " *
+                    "objective is undefined for it; use an estimator with `n_samples > 0`.",
+            ),
+        )
+    end
+    return nothing
 end
 
-function _previous_optimizer_state(optimizer, x0, previous_result)
-    return _optimizer_state(optimizer, x0, previous_result)
-end
-
-_outer_vi_objective(divergence, likelihood, residuals, x) =
-    _fdivergence_value(divergence, likelihood, x, residuals)
+_outer_vi_objective(family, divergence, likelihood, residuals, x) =
+    _fdivergence_value(family, divergence, likelihood, x, residuals)
 
 function _outer_vi_value_and_gradient(
-    adtype,
-    divergence,
-    likelihood,
-    residuals,
-    x;
-    fd_eps=1e-6,
-)
-    objective = y -> _outer_vi_objective(divergence, likelihood, residuals, y)
-    return _value_and_gradient(adtype, objective, x; fd_eps=fd_eps)
+        adtype,
+        family,
+        divergence,
+        likelihood,
+        residuals,
+        x;
+        fd_eps = 1.0e-6,
+    )
+    objective = y -> _outer_vi_objective(family, divergence, likelihood, residuals, y)
+    return _value_and_gradient(adtype, objective, x; fd_eps = fd_eps)
 end
 
-_outer_vi_metric(divergence, likelihood, residuals, x, v) =
-    _fdivergence_fishermetric(divergence, likelihood, x, residuals, v)
-
-_materialize_step_position(x) = x
-
-function _update_position(
-    problem::VariationalProblem,
-    samples::Samples,
-    previous_minimization_state=nothing,
-)
-    optimizer_state = _previous_optimizer_state(
-        problem.optimizer,
-        samples.position,
-        previous_minimization_state,
-    )
+function _optimize_position(problem::VariationalProblem, position, residuals, opt_state)
+    optimizer = problem.optimizer
+    family = problem.family
     divergence = problem.divergence
     likelihood = problem.likelihood
-    residuals = samples.residuals
     adtype = problem.adtype
-    fd_eps = problem.optimizer_options.fd_eps
-    result = _optimize(
-        problem.optimizer,
-        samples.position;
-        fun_and_grad=x -> _outer_vi_value_and_gradient(
+    return _optimize(
+        optimizer,
+        position;
+        fun_and_grad = x -> _outer_vi_value_and_gradient(
             adtype,
+            family,
             divergence,
             likelihood,
             residuals,
-            x;
-            fd_eps=fd_eps,
+            x,
         ),
-        metricp=(x, v) -> _outer_vi_metric(divergence, likelihood, residuals, x, v),
-        maxiter=problem.optimizer_options.maxiter,
-        miniter=problem.optimizer_options.miniter,
-        xtol=problem.optimizer_options.xtol,
-        absdelta=problem.optimizer_options.absdelta,
-        cg_rtol=problem.optimizer_options.cg_rtol,
-        cg_atol=problem.optimizer_options.cg_atol,
-        cg_maxiter=problem.optimizer_options.cg_maxiter,
-        cg_miniter=problem.optimizer_options.cg_miniter,
-        optimizer_state=optimizer_state,
+        metricp = NaturalGradientField(family, likelihood, residuals),
+        optimizer_state = opt_state,
+        _optimizer_kwargs(optimizer)...,
     )
-    return result
 end
 
-function _step_vi_impl(
-    problem::VariationalProblem,
-    samples::Samples,
-    state::VIState,
-)
-    drawn_samples, sample_state = _draw_samples(
-        problem,
-        samples.position,
-        state.rng,
-    )
-    minimization_state = _update_position(
-        problem,
-        drawn_samples,
-        state.minimization_state,
-    )
+# ── Step / fit ─────────────────────────────────────────────────────────────
 
-    new_samples = Samples(
-        _materialize_step_position(minimization_state.x),
-        drawn_samples.residuals;
-        keys=drawn_samples.keys,
-    )
-    new_state = VIState(
-        iteration=state.iteration + 1,
-        rng=state.rng,
-        sample_state=sample_state,
-        minimization_state=minimization_state,
-    )
-    return new_samples, new_state
+"""
+    step_vi!(rng, problem, state::VIState) -> state
+
+Advance the VI loop in place, reusing `state` and its buffers: a fresh
+[`draw_samples!`](@ref GeoVI.draw_samples!) → [`update!`](@ref GeoVI.update!) cycle —
+draw a Monte-Carlo set at the current mean, then optimize the variational parameters
+against that fixed set. `rng` is advanced in place; `problem` is the immutable config.
+
+`step_vi!` is a pure in-place mutation with no host-only state, so under Reactant
+you compile it yourself and call the compiled thunk in your loop:
+
+```julia
+rng, state = init(rng, problem)
+cstep = @compile step_vi!(rng, problem, state)
+for _ in 1:n; cstep(rng, problem, state); end
+```
+
+[`fit`](@ref) does this for you. For finer control, compose the phase primitives
+`GeoVI.draw_samples!` / `GeoVI.update!` directly.
+"""
+function step_vi!(rng, problem::VariationalProblem, state::VIState)
+    draw_samples!(rng, problem, state)
+    update!(problem, state)
+    return state
 end
 
-function _step_vi_default(
-    problem::VariationalProblem,
-    samples::Samples,
-    state::VIState,
-)
-    new_samples, new_state = _step_vi_impl(
-        problem,
-        samples,
-        _strip_cache(state),
-    )
-    return new_samples, _restore_cache(new_state, state.cache)
-end
-
-function _step_vi(
-    adtype,
-    problem::VariationalProblem,
-    samples::Samples,
-    state::VIState,
-)
-    return _step_vi_default(problem, samples, state)
-end
-
-function step_vi(
-    problem::VariationalProblem,
-    position::AbstractArray,
-    state::VIState,
-)
-    return step_vi(problem, Samples(position, nothing; keys=nothing), state)
-end
-
-function step_vi(
-    problem::VariationalProblem,
-    samples::Samples,
-    state::VIState,
-)
-    return _step_vi(problem.adtype, problem, samples, state)
-end
-
-step_vi(problem::VariationalProblem, state::VIState) = step_vi(problem, problem.initial_samples, state)
-
-function step_vi(
-    lh::AbstractLikelihood,
-    position::AbstractArray,
-    family::AbstractVariationalFamily,
-    divergence::AbstractFDivergence,
-    optimizer,
-    state::VIState,
-    config::VIConfig,
-)
-    problem = VariationalProblem(
-        lh,
-        position;
-        family=family,
-        divergence=divergence,
-        optimizer=optimizer,
-        config=config,
-    )
-    return step_vi(problem, position, state)
-end
-
-function step_vi(
-    lh::AbstractLikelihood,
-    samples::Samples,
-    family::AbstractVariationalFamily,
-    divergence::AbstractFDivergence,
-    optimizer,
-    state::VIState,
-    config::VIConfig,
-)
-    problem = VariationalProblem(
-        lh,
-        samples;
-        family=family,
-        divergence=divergence,
-        optimizer=optimizer,
-        config=config,
-    )
-    return step_vi(problem, samples, state)
-end
-
-function fit(
-    problem::VariationalProblem;
-    rng=Random.default_rng(),
-)
-    state = initialize_vi(problem, rng)
-    samples = problem.initial_samples
-    for _ in 1:problem.config.n_iterations
-        samples, state = step_vi(problem, samples, state)
+# Drive `n_iterations` of `step_vi!`. The eager path loops directly; the Reactant
+# extension overrides this to `@compile step_vi!` once and loop the compiled thunk.
+function _run_vi!(::Any, rng, problem::VariationalProblem, state::VIState, n_iterations)
+    for _ in 1:n_iterations
+        step_vi!(rng, problem, state)
     end
-    return samples, state
+    return state
 end
 
-fit(rng::AbstractRNG, problem::VariationalProblem) = fit(problem; rng=rng)
+"""
+    fit([rng], problem, n_iterations) -> AbstractVariationalDistribution
 
-function fit(
-    lh::AbstractLikelihood,
-    position_or_samples,
-    family::AbstractVariationalFamily,
-    divergence::AbstractFDivergence,
-    optimizer;
-    config::VIConfig=VIConfig(),
-    rng=Random.default_rng(),
-)
-    problem = VariationalProblem(
-        lh,
-        position_or_samples;
-        family=family,
-        divergence=divergence,
-        optimizer=optimizer,
-        config=config,
-    )
-    return fit(problem; rng=rng)
+Convenience driver: run `n_iterations` of [`step_vi!`](@ref) and return the fitted
+variational distribution ([`distribution`](@ref)). Under Reactant it compiles `step_vi!`
+once and loops the compiled thunk. `rng` defaults to `Random.default_rng()`.
+"""
+function fit(rng::AbstractRNG, problem::VariationalProblem, n_iterations::Integer)
+    n_iterations >= 0 || throw(ArgumentError("`n_iterations` must be non-negative"))
+    rng, state = init(rng, problem)
+    _run_vi!(problem.adtype, rng, problem, state, n_iterations)
+    return distribution(problem, state)
 end
 
-function fit(
-    rng::AbstractRNG,
-    lh::AbstractLikelihood,
-    position_or_samples,
-    family::AbstractVariationalFamily,
-    divergence::AbstractFDivergence,
-    optimizer;
-    config::VIConfig=VIConfig(),
-)
-    return fit(
-        lh,
-        position_or_samples,
-        family,
-        divergence,
-        optimizer;
-        config=config,
-        rng=rng,
-    )
-end
+fit(problem::VariationalProblem, n_iterations::Integer) =
+    fit(Random.default_rng(), problem, n_iterations)
 
-function fit(
-    lh::AbstractLikelihood,
-    position_or_samples;
-    family::AbstractVariationalFamily=GeoVIFamily(),
-    divergence::AbstractFDivergence=ReverseKL(),
-    optimizer=NewtonCG(),
-    config::VIConfig=VIConfig(),
-    rng=Random.default_rng(),
-)
-    return fit(lh, position_or_samples, family, divergence, optimizer; config=config, rng=rng)
-end
+"""
+    distribution(problem, state::VIState) -> AbstractVariationalDistribution
 
-function fit(
-    rng::AbstractRNG,
-    lh::AbstractLikelihood,
-    position_or_samples;
-    family::AbstractVariationalFamily=GeoVIFamily(),
-    divergence::AbstractFDivergence=ReverseKL(),
-    optimizer=NewtonCG(),
-    config::VIConfig=VIConfig(),
-)
-    return fit(lh, position_or_samples, family, divergence, optimizer; config=config, rng=rng)
-end
+The fitted variational distribution `q_θ` at the current state — `distribution(family, θ,
+likelihood)` with `θ = state.position`. It is a pure distribution (no retained samples):
+draw from it with `rand(rng, q[, n])`, and `logdensity(q, ξ)` where the family supports it.
+"""
+distribution(problem::VariationalProblem, state::VIState) =
+    distribution(problem.family, state.position, problem.likelihood)

@@ -5,9 +5,11 @@ version = "0.1.0"
 
 [deps]
 ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
+Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+PSIS = "ce719bf2-d5d0-4fb9-925d-10a81b42ad04"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 ReactantCore = "a3311ec8-5e00-46d5-b541-4f83e724a433"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
@@ -21,15 +23,17 @@ GeoVIEnzymeExt = ["ADTypes", "Enzyme"]
 GeoVIReactantExt = ["ADTypes", "Reactant"]
 
 [compat]
-ADTypes = "1.21.0"
+ADTypes = "1"
 Enzyme = "0.13"
-LogExpFunctions = "0.3.29"
-Optimisers = "0.4.7"
-Random = "1.11.0"
+Functors = "0.5"
+LogExpFunctions = "0.3"
+Optimisers = "0.4"
+PSIS = "0.9"
+Random = "1"
 Reactant = "0.2"
-ReactantCore = "0.1.19"
-Statistics = "1.11.1"
-julia = "1.10.10"
+ReactantCore = "0.1"
+Statistics = "1"
+julia = "1.10"
 
 [extras]
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"

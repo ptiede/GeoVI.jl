@@ -1,9 +1,9 @@
-struct PoissonLikelihood{D,W} <: AbstractLikelihood
+struct PoissonLikelihood{D, W} <: AbstractLikelihood
     data::D
     weight::W
 end
 
-function PoissonLikelihood(data; weight=1)
+function PoissonLikelihood(data; weight = 1)
     _validate_nonnegative("weight", weight)
     return PoissonLikelihood(data, weight)
 end

@@ -1,11 +1,14 @@
 module GeoVI
 
 using ADTypes
+using Functors: fmap
 using LinearAlgebra
 using LogExpFunctions: log1pexp, logistic
 using Optimisers
 using Random
+using PSIS
 using ReactantCore
+import Statistics
 
 export randn_like
 export AbstractLikelihood,
@@ -26,6 +29,8 @@ export AbstractLikelihood,
     metric,
     compose
 export Samples, posterior_samples, recenter
+export AbstractVariationalDistribution, DiagonalGaussian, FisherGaussianDistribution, distribution
+export logdensity_unnormalized, log_importance_ratio, pareto_diagnostic
 export MetricSample,
     ConjugateGradientInfo,
     ConjugateGradient,
@@ -37,20 +42,23 @@ export MetricSample,
 export AbstractVariationalFamily,
     GeoVIFamily,
     MGVIFamily,
+    MeanFieldGaussian,
     AbstractFDivergence,
     ReverseKL,
-    ForwardKL,
     AbstractOptimizer,
     NewtonCG,
-    VIConfig,
+    AbstractEstimator,
+    MCEstimator,
     VariationalProblem,
     VIState,
-    initialize_vi,
+    init,
+    reset!,
     draw_metric_sample,
     draw_linear_residual,
     update_nonlinear_residual,
     draw_residual,
-    step_vi,
+    draw_residuals,
+    step_vi!,
     fit
 
 include("tree_utils.jl")
@@ -59,7 +67,13 @@ include("cg.jl")
 include("optimize.jl")
 include("sampling.jl")
 include("samples.jl")
+include("families/interface.jl")
+include("families/mgvi.jl")
+include("families/geovi.jl")
+include("families/fisher_gaussian.jl")
+include("families/meanfield.jl")
 include("vi.jl")
 include("nonlinear.jl")
+include("psis.jl")
 
 end

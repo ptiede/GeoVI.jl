@@ -1,10 +1,10 @@
-struct BinomialLikelihood{D,T,W} <: AbstractLikelihood
+struct BinomialLikelihood{D, T, W} <: AbstractLikelihood
     data::D
     trials::T
     weight::W
 end
 
-function BinomialLikelihood(data; trials, weight=1)
+function BinomialLikelihood(data; trials, weight = 1)
     _validate_binomial_data(data, trials)
     _validate_nonnegative("weight", weight)
     return BinomialLikelihood(data, trials, weight)
